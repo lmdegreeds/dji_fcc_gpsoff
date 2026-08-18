@@ -40,6 +40,16 @@ class Features(ctx: Context) {
      *  last holder disconnects. A no-op if this Features never connected. */
     fun disconnect() { if (holdsMain) { holdsMain = false; DumlTransport.release() } }
 
+    companion object {
+        /** When the last Apply FCC finished, from any caller. Process-wide because
+         *  the bus is: the keepalive, the overlay and the diag server all share it. */
+        @Volatile var lastApplyFinishedMs = 0L; private set
+
+        /** ms since the last apply finished, or [Long.MAX_VALUE] if none this run. */
+        fun sinceLastApplyMs(): Long =
+            if (lastApplyFinishedMs == 0L) Long.MAX_VALUE else System.currentTimeMillis() - lastApplyFinishedMs
+    }
+
     /**
      * Switch radio CE→FCC by running FreeFCC's confirmed-working fcc.json
      * sequence (sender 130, port 40009, 2 rounds) — the register writes
@@ -55,8 +65,13 @@ class Features(ctx: Context) {
         // Hold ONE lease across the profile AND the follow-up regulatory write, so
         // the whole Apply FCC is atomic against another of our sessions on 40009
         // (previously the profile released the lock before the regulatory write).
-        val lease = PortSessionLock.acquire(DumlWire.PORT_FCC) ?: run {
-            DiagLog.warn("applyFcc: port ${DumlWire.PORT_FCC} busy — skipped"); return false
+        // Short timeout on purpose: the lock's 3 s default let a second apply QUEUE
+        // behind the first and run back to back. Measured on hardware — a keepalive
+        // apply, an overlay tap and a session-edge apply once stacked into three
+        // consecutive profiles, ~135 connects in a few seconds. An apply that is
+        // already running is doing the job; a second one only hammers the bus.
+        val lease = PortSessionLock.acquire(DumlWire.PORT_FCC, timeoutMs = 300) ?: run {
+            DiagLog.warn("applyFcc: another apply is already running — skipped"); return false
         }
         return try {
             val res = runner.run(runner.load("fcc.json"), alreadyLeased = true)
@@ -67,7 +82,7 @@ class Features(ctx: Context) {
             val ok = res.sent && reg
             if (!ok) DiagLog.warn("applyFcc: incomplete send (frames=${res.sent}, regulatory=$reg) — not applied")
             ok
-        } finally { lease.close() }
+        } finally { lastApplyFinishedMs = System.currentTimeMillis(); lease.close() }
     }
 
     // Restore CE was removed on purpose: reverting to CE drops 5.8 and needs an

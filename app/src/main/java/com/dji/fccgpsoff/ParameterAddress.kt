@@ -63,15 +63,16 @@ class ParameterAddress(private val lito: String, private val other: String = lit
                       writes: Int = 3, gapMs: Long = 100): Boolean = withContext(Dispatchers.IO) {
         val n = name()
         val body = hashOf(n) + value
-        var anySent = false
-        repeat(writes) {
+        // All repeats over ONE connection: on 40009 a fresh connect evicts the
+        // previous client, so three sockets in a row could knock out the very
+        // writes they repeat (see DumlBus.sendMany).
+        val wires = (0 until writes).map {
             val inner = DumlNative.nativeBuildFrame(senderFor(port), DumlWire.DST_FLIGHT,
                 ctFor(port), DumlWire.CMDSET_FLYC, DumlWire.CMDID_WRITE_PARAM_HASH, body)
-            val wire = if (wrapped) DumlWire.wrap(inner) else inner
-            if (DumlBus.sendFrame(port, wire, "write $n=${DumlWire.toHex(value)}")) anySent = true
-            delay(gapMs)
+            if (wrapped) DumlWire.wrap(inner) else inner
         }
-        anySent
+        val tag = "write $n=${DumlWire.toHex(value)}"
+        DumlBus.sendMany(port, wires, gapMs.toInt(), List(wires.size) { tag }) > 0
     }
 
     companion object {

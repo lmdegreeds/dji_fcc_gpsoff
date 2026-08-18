@@ -130,7 +130,21 @@ public:
     // route back on RC2), so a false here means a genuine send failure.
     static bool send_frame(int port, const Bytes& wire);
 
-    // DUSS / 4G side channel: connect AF_UNIX abstract "/duss/mb/0x205" and
+    // Write MANY frames over ONE connection, `gap_ms` apart, then close.
+    //
+    // Measured on RC 2: the 40009 broker serves essentially one client at a time
+    // and each new connect evicts the incumbent. A profile sent as one socket per
+    // frame is therefore 45 rapid connects that knock each OTHER out — during an
+    // apply our own persistent channel was evicted 76 times in 9 s with windows
+    // collapsing to 0-70 ms, while it sat on calm 2-4 s windows between applies.
+    // A frame whose socket is evicted before the broker forwards it is simply
+    // lost, and the write still reports success because the bytes reached the
+    // socket. One connection removes the self-eviction entirely.
+    //
+    // Returns how many frames were fully written, or -1 if the connect failed.
+    static int send_many(int port, const std::vector<Bytes>& frames, int gap_ms);
+
+    // DUSS side channel: connect AF_UNIX abstract "/duss/mb/0x205" and
     // write one frame (no readback — the module does not answer).
     static bool duss_send(const Bytes& wire);
 

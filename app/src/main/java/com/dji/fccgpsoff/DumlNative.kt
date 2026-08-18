@@ -56,6 +56,16 @@ object DumlNative {
      */
     external fun nativeSendFrame(port: Int, wire: ByteArray): Boolean
 
+    /**
+     * Write several already-built frames over ONE connection, [gapMs] apart.
+     * Returns how many were fully written, or -1 if the connect failed.
+     *
+     * The 40009 broker serves one client at a time and evicts the incumbent on
+     * every new connect, so a frame-per-socket profile knocks its own frames out
+     * mid-flight (see `Transport::send_many`). Use this for any multi-frame write.
+     */
+    external fun nativeSendMany(port: Int, frames: Array<ByteArray>, gapMs: Int): Int
+
     /** Send one wire frame straight onto the controller's DUSS message bus
      *  (abstract unix socket `/duss/mb/0x205`) — the firmware-bus diagnostic path,
      *  used only by the diag server's duss endpoints. See `doc/DUSS-HARDWARE-FINDINGS.md`. */

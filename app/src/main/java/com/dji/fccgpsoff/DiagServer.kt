@@ -642,6 +642,9 @@ object DiagServer {
                 }
                 "/log" -> DiagLog.asText()
                 "/logjson" -> DiagLog.asJson()
+                // Which build is actually running. Ask this BEFORE interpreting a log
+                // pulled from a live controller — see CLAUDE.md.
+                "/version" -> AppVersion.of(appCtx)
                 "/stats" -> DumlBus.stats()
                 "/ports" -> DumlBus.probePorts()
                 // The main channel is on-demand: /connect raises it by hand and holds it
@@ -828,7 +831,7 @@ object DiagServer {
                     val ms = (query(path, "ms")?.toIntOrNull() ?: 1000).coerceIn(0, MAX_WINDOW_MS)
                     probe(port, DumlWire.hex(hex), ms)
                 }
-                "/help" -> "endpoints: /log /logjson /stats /ports /connect /disconnect /fcc " +
+                "/help" -> "endpoints: /version /log /logjson /stats /ports /connect /disconnect /fcc " +
                         "/foreground /identity /identity/forget /model /rc /screen /a11y " +
                         "/keepon?mode=home_point|periodic /keepoff /overlayon /overlayoff " +
                         "/profile?lito=1|0 /setauto?ka=&ov=&diag= /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +

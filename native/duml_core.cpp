@@ -620,6 +620,19 @@ bool Transport::send_frame(int port, const Bytes& wire) {
     return ok;
 }
 
+int Transport::send_many(int port, const std::vector<Bytes>& frames, int gap_ms) {
+    int fd = connect_loopback(port);
+    if (fd < 0) return -1;
+    int written = 0;
+    for (size_t i = 0; i < frames.size(); ++i) {
+        if (!send_all(fd, frames[i].data(), frames[i].size())) break;
+        ++written;
+        if (gap_ms > 0 && i + 1 < frames.size()) usleep((useconds_t)gap_ms * 1000);
+    }
+    ::shutdown(fd, SHUT_RDWR); ::close(fd);
+    return written;
+}
+
 bool Transport::duss_send(const Bytes& wire) {
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;

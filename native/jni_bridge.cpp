@@ -125,6 +125,22 @@ jbyteArray jni_param_hash(JNIEnv* e, jclass, jstring name) {
     return to_jbytes(e, h);
 }
 
+// Write a whole profile over one socket. `frames` is byte[][]; returns the count
+// of frames fully written, or -1 when the connect failed.
+jint jni_send_many(JNIEnv* e, jclass, jint port, jobjectArray frames, jint gap_ms) {
+    if (!frames) return -1;
+    jsize n = e->GetArrayLength(frames);
+    std::vector<Bytes> out;
+    out.reserve((size_t)n);
+    for (jsize i = 0; i < n; ++i) {
+        jobject o = e->GetObjectArrayElement(frames, i);
+        if (!o) continue;
+        out.push_back(bytes_from_java(e, (jbyteArray)o));
+        e->DeleteLocalRef(o);                     // n can be ~45: do not fill the local-ref table
+    }
+    return (jint)Transport::send_many((int)port, out, (int)gap_ms);
+}
+
 jboolean jni_duss(JNIEnv* e, jclass, jbyteArray wire) {
     return Transport::duss_send(bytes_from_java(e, wire)) ? JNI_TRUE : JNI_FALSE;
 }
@@ -203,6 +219,7 @@ const JNINativeMethod kMethods[] = {
     {"nativeSendOnce",  "(I[BI)[B",              (void*)jni_send_once},
     {"nativeSendOnceMatch","(I[BIII)[B",         (void*)jni_send_once_match},
     {"nativeSendFrame", "(I[B)Z",                (void*)jni_send_frame},
+    {"nativeSendMany",  "(I[[BI)I",              (void*)jni_send_many},
     {"nativeProbePort", "(I)Z",                   (void*)jni_probe},
     {"nativeStats",     "()Ljava/lang/String;",   (void*)jni_stats},
 };

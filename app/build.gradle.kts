@@ -24,8 +24,11 @@ android {
         applicationId = "com.dji.fccgpsoff"
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        // Bumped on EVERY build, debug and release — see CLAUDE.md. The value is
+        // printed at startup and served by the diag server, so a live controller
+        // can always be asked which build it is actually running.
+        versionCode = 2
+        versionName = "1.0.1"
 
         ndk {
             // The ABIs DJI smart controllers ship.
@@ -92,6 +95,19 @@ android {
     // JVM unit tests touch DiagLog, which mirrors to android.util.Log; without
     // this, unmocked android.* stubs throw instead of returning defaults.
     testOptions { unitTests.isReturnDefaultValues = true }
+}
+
+// Put the version in the APK's file name, so a build sitting in Downloads or
+// attached to a release can be identified without installing it. Together with the
+// version printed at startup and served by /version, that closes the "which build
+// is actually on the controller?" question at every stage. See CLAUDE.md.
+//   dji-fcc-gpsoff-1.0.1-debug.apk / dji-fcc-gpsoff-1.0.1-release.apk
+android.applicationVariants.all {
+    val variant = this
+    outputs.all {
+        (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName =
+            "dji-fcc-gpsoff-${variant.versionName}-${variant.buildType.name}.apk"
+    }
 }
 
 // Say which key a release build will carry, so "signed with the debug key" is

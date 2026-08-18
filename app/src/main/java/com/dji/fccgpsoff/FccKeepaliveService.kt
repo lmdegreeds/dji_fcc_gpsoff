@@ -322,6 +322,18 @@ class FccKeepaliveService : Service() {
             val session = FlyLink.generation
             if (session != lastSession) {
                 lastSession = session
+                // A session that opens right after OUR OWN burst is very likely our
+                // doing, not a new aircraft. Measured on hardware: 4 of 6 link drops
+                // came 0.7-5.1 s after an apply (the other two were the pilot pulling
+                // power), and re-applying on that edge fed a loop — burst knocks the
+                // link, Fly relinks and re-pushes its region, we see a "new session"
+                // and burst again. Let the link settle instead; the blind timer still
+                // covers a genuine relink we skipped here.
+                if (Features.sinceLastApplyMs() < SELF_INFLICTED_MS) {
+                    DiagLog.info("keepalive: session #$session opened ${Features.sinceLastApplyMs() / 1000}s after our own apply — " +
+                        "treating it as our own disturbance, not re-applying")
+                    continue
+                }
                 DiagLog.info("keepalive: DJI Fly shows a new aircraft session (#$session) — applying FCC for it")
                 bootstrapApply(features)
                 lastApplyMs = System.currentTimeMillis()
@@ -449,6 +461,11 @@ class FccKeepaliveService : Service() {
         private const val BOOTSTRAP_FAST_REAPPLY_MS = 3_000L
         /** How often the maintenance loop re-checks fast-moving state (the session edge). */
         private const val EDGE_TICK_MS = 500L
+        /** A link that drops within this long after our own apply is treated as
+         *  collateral from that apply rather than a new aircraft. Covers the whole
+         *  observed range of self-inflicted drops (0.7-5.1 s) with room for the
+         *  relink and DJI Fly repainting its screen afterwards. */
+        private const val SELF_INFLICTED_MS = 20_000L
         /** How long the bootstrap will hold while DJI Fly reports no aircraft before
          *  giving up and letting the maintenance loop drive. The session edge re-enters
          *  it the moment an aircraft appears, so nothing is lost by not waiting here. */

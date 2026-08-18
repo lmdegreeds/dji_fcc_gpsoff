@@ -41,6 +41,33 @@ object DumlBus {
     }
 
     /**
+     * Write a whole batch of frames over ONE connection — the send path for
+     * anything that emits more than a couple of frames.
+     *
+     * Why this exists (measured on RC 2, `doc/drone-link-detection.md`): the 40009
+     * broker keeps one client at a time and every fresh connect evicts the last
+     * one. An FCC apply used to be 45 back-to-back connects, so its own frames
+     * raced each other — during an apply our persistent channel was evicted 76
+     * times in 9 s, windows collapsing to 0-70 ms, against calm 2-4 s windows
+     * between applies. Each eviction can drop a frame the broker had not yet
+     * forwarded, and the write still looks successful because the bytes reached
+     * the socket. Sending the batch down one socket removes that race.
+     *
+     * Logs every frame (so the diag log reads as before) and returns how many
+     * actually went out; [tags] is parallel to [frames].
+     */
+    fun sendMany(port: Int, frames: List<ByteArray>, gapMs: Int, tags: List<String>): Int {
+        if (frames.isEmpty()) return 0
+        for ((i, w) in frames.withIndex()) DiagLog.tx(port, tags.getOrElse(i) { "" }, w)
+        val n = DumlNative.nativeSendMany(port, frames.toTypedArray(), gapMs)
+        when {
+            n < 0 -> DiagLog.warn("sendMany: no connect on $port — ${frames.size} frames not sent")
+            n < frames.size -> DiagLog.warn("sendMany: only $n/${frames.size} frames written on $port")
+        }
+        return n
+    }
+
+    /**
      * Diagnostics: which loopback DUML ports are open right now.
      *
      * Note 40007 IS probed (connect + immediate close) because knowing it is up

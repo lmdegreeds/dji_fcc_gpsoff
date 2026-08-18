@@ -1,6 +1,7 @@
 package com.dji.fccgpsoff
 
 import android.app.Application
+import android.content.Context
 
 /**
  * Loads persisted [AppState] once, in the single place guaranteed to run before
@@ -14,6 +15,11 @@ class App : Application() {
         // Before AppState, so a failure while loading state is still recorded.
         CrashLog.install(this)
         AppState.load(this)
+        // FIRST diagnostic line of every session. Without it a live controller cannot
+        // be asked which build it is running, and a log read remotely is ambiguous —
+        // that ambiguity once cost half an hour of arguing over whether a fix was
+        // even installed. See CLAUDE.md.
+        DiagLog.info("build ${AppVersion.of(this)} starting")
         // Passive departure from DJI Fly's 40007 video-mirror port.
         //
         // We deliberately do NOT force-close in-flight 40007 reads when Fly takes the
@@ -29,4 +35,13 @@ class App : Application() {
         // The aux OSD probe likewise releases on its own tick (DroneLinkProbe loop), not
         // slammed from the outside.
     }
+}
+
+/** The running build, read from the package (BuildConfig generation is off). */
+object AppVersion {
+    fun of(ctx: Context): String = runCatching {
+        val pi = ctx.packageManager.getPackageInfo(ctx.packageName, 0)
+        @Suppress("DEPRECATION")
+        "v${pi.versionName} (code ${pi.versionCode})"
+    }.getOrDefault("v?")
 }

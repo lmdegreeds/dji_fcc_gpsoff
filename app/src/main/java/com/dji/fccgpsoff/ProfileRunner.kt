@@ -1,7 +1,9 @@
 package com.dji.fccgpsoff
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /**
@@ -94,20 +96,35 @@ class ProfileRunner(private val ctx: Context) {
         var wroteAny = false          // a response-only profile writes nothing → sent must be false
         try {
             repeat(p.rounds) { round ->
+                val wires = ArrayList<ByteArray>(p.frames.size)
+                val tags = ArrayList<String>(p.frames.size)
                 for (fr in p.frames) {
                     val inner = DumlNative.nativeBuildFrame(fr.sender, fr.dst, fr.cmdType, fr.cmdSet, fr.cmdId, fr.payload)
                     val wire = if (p.wrapper) DumlWire.wrap(inner) else inner
                     val tag = "%02X:%02X".format(fr.cmdSet, fr.cmdId) + if (fr.note.isNotEmpty()) " — ${fr.note}" else ""
                     if (p.needsResponse) {
-                        // reply path (device info / diag): a null reply is normal on
-                        // RC2, so it can't gate [sent] — leave allSent to the writes.
+                        // reply path (device info / diag): each frame needs its own
+                        // read window, so it stays one socket per frame. A null reply
+                        // is normal on RC2, so it can't gate [sent].
                         val reply = DumlBus.sendOnce(p.port, wire, p.readWindowMs, "${p.name} $tag")
                         if (reply != null) lastReply = reply
+                        delay(p.interFrameMs)
                     } else {
-                        wroteAny = true
-                        if (!DumlBus.sendFrame(p.port, wire, "${p.name} $tag")) allSent = false
+                        wires += wire
+                        tags += "${p.name} $tag"
                     }
-                    delay(p.interFrameMs)
+                }
+                // Write profiles go out as ONE connection per round. The broker on
+                // 40009 evicts its current client on every new connect, so the old
+                // socket-per-frame loop made the profile race itself — see
+                // DumlBus.sendMany. Timing on the wire is unchanged: the same
+                // inter-frame gap is applied natively between writes.
+                if (wires.isNotEmpty()) {
+                    wroteAny = true
+                    val sent = withContext(Dispatchers.IO) {
+                        DumlBus.sendMany(p.port, wires, p.interFrameMs.toInt(), tags)
+                    }
+                    if (sent != wires.size) allSent = false
                 }
                 if (round < p.rounds - 1) delay(p.interRoundMs)
             }
