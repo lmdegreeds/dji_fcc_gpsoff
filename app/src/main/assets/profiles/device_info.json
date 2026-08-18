@@ -1,0 +1,15 @@
+{
+  "name": "Device Info",
+  "description": "GENERAL VersionInquiry (00:01) to ANY — returns HW/bootloader/app version. Request/response.",
+  "sender": 130,
+  "cmd_type": 32,
+  "rounds": 1,
+  "inter_frame_delay_ms": 0,
+  "inter_round_delay_ms": 0,
+  "read_window_ms": 500,
+  "needs_response": true,
+  "port": 40009,
+  "frames": [
+    { "s": 0, "i": 1, "d": 0, "p": "" }
+  ]
+}

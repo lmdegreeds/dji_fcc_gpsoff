@@ -1,0 +1,30 @@
+DJI_FCC_GPSOFF
+Copyright (C) 2026 the DJI_FCC_GPSOFF authors.
+
+This product is licensed under the GNU Affero General Public License v3.0 or
+later. See LICENSE for the full text.
+
+--------------------------------------------------------------------------------
+Third-party material incorporated in this project
+--------------------------------------------------------------------------------
+
+FreeFCC / SkylabFCCfree — AGPL-3.0
+    The DUML payloads in app/src/main/assets/profiles/fcc.json (and the reference
+    asset ce_restore.json), the 0x51:0x1A wlm_service_mode_switch_req 4G frame,
+    and the 00:51 serial-query approach are derived from these projects.
+
+lmdegreeds/dji_gpsoff
+    The floating-overlay WINDOW mechanism in OverlayService.kt
+    (TYPE_APPLICATION_OVERLAY + FLAG_NOT_FOCUSABLE, the draggable handle, the
+    tap-vs-drag gesture) is adapted from this project. Its DUML code, which
+    addresses parameters by index, is NOT used — all parameter addressing here is
+    by name-hash.
+
+--------------------------------------------------------------------------------
+
+Files under params_example/ are parameter-table exports produced by the
+"dronehack" tool from DJI aircraft. They are included as sample input for the
+built-in parameter editor.
+
+DJI, DJI Fly, DJI RC and DJI RC 2 are trademarks of SZ DJI Technology Co., Ltd.
+This project is not affiliated with, endorsed by, or supported by DJI.

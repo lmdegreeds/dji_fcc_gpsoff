@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="accessibility_desc">Reads the DJI aircraft model name shown on DJI Fly’s screen and tracks which app is in the foreground, so reads that could disturb DJI Fly’s video are blocked while Fly is on screen. No data leaves the device.</string>
+</resources>

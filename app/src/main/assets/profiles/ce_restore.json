@@ -1,0 +1,20 @@
+{
+  "name": "CE Restore",
+  "_note": "Reverses Apply FCC: un-force the SDR FCC registers (0xffff0048/0063 = 0) and set the radio region back to 0 (CE). Restores the more-restrictive CE state. Like FCC, the change takes effect after a controller+aircraft reboot (written to persistent params). Verified on Lito X1 v300.",
+  "sender": 130,
+  "cmd_type": 32,
+  "rounds": 2,
+  "inter_frame_delay_ms": 30,
+  "inter_round_delay_ms": 100,
+  "read_window_ms": 50,
+  "port": 40009,
+  "frames": [
+    { "s": 16, "i": 88,  "d": 18, "p": "030100",                 "note": "enter service mode" },
+    { "s": 9,  "i": 39,  "d": 9,  "p": "00024800ffff0000000000", "note": "SDR reg 0xffff0048=0 (un-force FCC, 2.4)" },
+    { "s": 9,  "i": 39,  "d": 9,  "p": "00026300ffff0000000000", "note": "SDR reg 0xffff0063=0 (un-force FCC, 5.8)" },
+    { "s": 6,  "i": 140, "d": 9,  "p": "000000",                 "note": "RADIO param 0" },
+    { "s": 6,  "i": 114, "d": 6,  "p": "00000000000000",         "note": "RADIO region -> 0 (CE)" },
+    { "s": 6,  "i": 114, "d": 6,  "p": "000000000000ff",         "note": "RADIO commit region 0" },
+    { "s": 16, "i": 88,  "d": 18, "p": "030100",                 "note": "exit service mode" }
+  ]
+}

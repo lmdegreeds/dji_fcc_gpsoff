@@ -1,0 +1,82 @@
+[
+ {
+  "id": "_common",
+  "label_en": "Common to all models",
+  "label_ru": "Общие для всех моделей",
+  "file": "_common.json",
+  "count": 252,
+  "unique": 0
+ },
+ {
+  "id": "litox1",
+  "label_en": "DJI Lito X1",
+  "label_ru": "DJI Lito X1",
+  "file": "litox1.json",
+  "count": 953,
+  "unique": 82
+ },
+ {
+  "id": "air3s",
+  "label_en": "DJI Air 3S",
+  "label_ru": "DJI Air 3S",
+  "file": "air3s.json",
+  "count": 876,
+  "unique": 11
+ },
+ {
+  "id": "air3",
+  "label_en": "DJI Air 3",
+  "label_ru": "DJI Air 3",
+  "file": "air3.json",
+  "count": 821,
+  "unique": 1
+ },
+ {
+  "id": "mini4pro",
+  "label_en": "DJI Mini 4 Pro",
+  "label_ru": "DJI Mini 4 Pro",
+  "file": "mini4pro.json",
+  "count": 804,
+  "unique": 2
+ },
+ {
+  "id": "neo",
+  "label_en": "DJI Neo",
+  "label_ru": "DJI Neo",
+  "file": "neo.json",
+  "count": 840,
+  "unique": 0
+ },
+ {
+  "id": "neo2",
+  "label_en": "DJI Neo 2",
+  "label_ru": "DJI Neo 2",
+  "file": "neo2.json",
+  "count": 927,
+  "unique": 6
+ },
+ {
+  "id": "flip",
+  "label_en": "DJI Flip",
+  "label_ru": "DJI Flip",
+  "file": "flip.json",
+  "count": 846,
+  "unique": 3
+ },
+ {
+  "id": "avata2",
+  "label_en": "DJI Avata 2",
+  "label_ru": "DJI Avata 2",
+  "file": "avata2.json",
+  "count": 927,
+  "unique": 19
+ },
+ {
+  "id": "mavicair2",
+  "label_en": "DJI Mavic Air 2",
+  "label_ru": "DJI Mavic Air 2",
+  "file": "mavicair2.json",
+  "count": 681,
+  "unique": 350
+ }
+]

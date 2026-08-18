@@ -1,0 +1,138 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- Self-update: download a release APK and hand it to the package installer.
+         This only declares the capability — the user must still grant "install
+         unknown apps" for this app (Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+         offered by the setup wizard) AND confirm every individual install. -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+
+    <!-- The PackageInstaller status callback carries an Intent we are expected to
+         launch (the system's install-confirmation screen). A dynamically registered
+         receiver is reachable by any app that knows the action, so it is guarded by
+         a signature-level permission: only a build signed with our key can deliver
+         that broadcast, and therefore nobody else can hand us an Intent to launch. -->
+    <permission
+        android:name="com.dji.fccgpsoff.permission.INSTALL_STATUS"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.dji.fccgpsoff.permission.INSTALL_STATUS" />
+
+    <!-- Flight records. On Android 11+ another app's Android/data is reachable
+         only through a SAF folder grant; this only helps older/permissive ROMs
+         where the plain-File fallback can work. -->
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+
+    <!-- Screen recordings live in the public Movies folders (internal + SD card),
+         read through MediaStore. On Android 13+ that needs the granular media
+         permission instead of READ_EXTERNAL_STORAGE. -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+
+    <!-- Package-visibility filtering (Android 11+) hides other apps from
+         getPackageInfo unless they are declared here. The params page needs to know
+         WHICH DJI app is installed so its "Stop Fly" button can open that one's App
+         info page; without this the lookup always reports "not installed". -->
+    <queries>
+        <package android:name="dji.go.v5" />
+        <package android:name="dji.go.v6" />
+        <package android:name="com.dji.industry.pilot" />
+    </queries>
+
+    <application
+        android:name=".App"
+        android:label="DJI_FCC_GPSOFF"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:usesCleartextTraffic="true"
+        android:extractNativeLibs="true"
+        android:allowBackup="false">
+
+        <!-- adjustPan, not the default resize: the RC's screen is short and landscape, so
+             the keyboard takes about half of it. Resizing squeezed the parameter page until
+             the search field collapsed to a sliver and the text being typed was clipped out
+             of sight. Panning keeps the focused field whole and just scrolls it above the
+             keyboard. -->
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTop"
+            android:windowSoftInputMode="adjustPan"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- First-run setup wizard. Not exported: MainActivity routes here when
+             AppState.wizardDone is false, and the ⋮ menu can re-run it. -->
+        <activity
+            android:name=".SetupWizardActivity"
+            android:launchMode="singleTop"
+            android:exported="false" />
+
+        <service
+            android:name=".FccKeepaliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="re-applies radio FCC mode over the on-device proxy" />
+        </service>
+
+        <service
+            android:name=".DiagService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="network diagnostics server" />
+        </service>
+
+        <service
+            android:name=".OverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="floating control overlay for DJI Fly" />
+        </service>
+
+        <!-- Reads DJI Fly's on-screen model name + tracks the foreground app so
+             read-family features can be gated. Must be enabled by the user in
+             Settings > Accessibility; the app works without it (gate defaults to
+             allow, model falls back to the DUML probe). -->
+        <service
+            android:name=".DjiFlyAccessibilityService"
+            android:exported="false"
+            android:label="DJI_FCC_GPSOFF — model &amp; foreground"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <receiver
+            android:name=".BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                <!-- An in-place APK update stops the app and kills the services;
+                     without this nothing re-arms until the next boot or launch. -->
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

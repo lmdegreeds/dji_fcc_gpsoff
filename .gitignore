@@ -1,0 +1,45 @@
+# --- Gradle / build output ---
+.gradle/
+build/
+app/build/
+app/.cxx/
+.cxx/
+.externalNativeBuild/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Machine-specific (sdk.dir) — regenerate per machine
+local.properties
+
+# --- IDE / editor ---
+.idea/
+.vscode/
+*.iml
+captures/
+
+# --- Tooling scratch, not part of the project ---
+.claude/
+*.log
+
+# --- Signing material — never commit ---
+# Losing these means never being able to update an installed release; leaking
+# them means anyone can publish an update that Android accepts as genuine.
+signing/
+*.jks
+*.keystore
+keystore.properties
+signing.properties
+# Local build notes that quote the passphrase
+BUILD_SIGNING.local.md
+
+# --- Local scratch / captures ---
+tmp/
+*.pcap
+diag-export/
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
