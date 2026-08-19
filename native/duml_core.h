@@ -15,6 +15,7 @@
 #define DUML_CORE_H
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 #include <string>
 
@@ -142,7 +143,10 @@ public:
     // socket. One connection removes the self-eviction entirely.
     //
     // Returns how many frames were fully written, or -1 if the connect failed.
-    static int send_many(int port, const std::vector<Bytes>& frames, int gap_ms);
+    // Returns {frames written, reconnects used}. The reconnect count matters:
+    // the profile opens a service-mode session (10:58) and closes it, so a batch
+    // split across sockets may be a batch the aircraft ignores.
+    static std::pair<int,int> send_many(int port, const std::vector<Bytes>& frames, int gap_ms);
 
     // DUSS side channel: connect AF_UNIX abstract "/duss/mb/0x205" and
     // write one frame (no readback — the module does not answer).

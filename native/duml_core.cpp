@@ -625,9 +625,9 @@ bool Transport::send_frame(int port, const Bytes& wire) {
     return ok;
 }
 
-int Transport::send_many(int port, const std::vector<Bytes>& frames, int gap_ms) {
+std::pair<int,int> Transport::send_many(int port, const std::vector<Bytes>& frames, int gap_ms) {
     int fd = connect_loopback(port);
-    if (fd < 0) return -1;
+    if (fd < 0) return {-1, 0};
     int written = 0;
     int reconnects = 0;
     for (size_t i = 0; i < frames.size(); ) {
@@ -644,14 +644,12 @@ int Transport::send_many(int port, const std::vector<Bytes>& frames, int gap_ms)
         // not fewer frames, so under contention it must degrade to the old behavior
         // rather than silently drop the profile.
         ::shutdown(fd, SHUT_RDWR); ::close(fd);
-        if (++reconnects > kSendManyMaxReconnects) return written;
+        if (++reconnects > kSendManyMaxReconnects) return {written, reconnects};
         fd = connect_loopback(port);
-        if (fd < 0) return written;
+        if (fd < 0) return {written, reconnects};
     }
     ::shutdown(fd, SHUT_RDWR); ::close(fd);
-    if (reconnects > 0)
-        LOGI("send_many: %d frames on port %d needed %d reconnect(s)", written, port, reconnects);
-    return written;
+    return {written, reconnects};
 }
 
 bool Transport::duss_send(const Bytes& wire) {

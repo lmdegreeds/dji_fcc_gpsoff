@@ -27,24 +27,26 @@ object ApplyAt {
     private var job: Job? = null
     @Volatile private var armedSec = -1L
     @Volatile private var armedThen = 0L
+    @Volatile private var armedCount = 1
     @Volatile private var lastResult = ""
 
     /**
      * @param sec  delay from the aircraft appearing to the FIRST apply
-     * @param then if > 0, fire a SECOND apply this many seconds after the first —
-     *             the test for whether bursts interfere with each other. A series is
-     *             what the app actually does; if two closely spaced applies work no
-     *             worse than one, the retry strategy is sound, and if the second one
-     *             spoils a first that would have taken, it is not.
+     * @param then spacing between applies when [count] > 1
+     * @param count how many applies to fire in total. A single apply lands about half
+     *              the time, so the app never relies on one — it fires a series. This
+     *              is how the series itself gets measured, at a known offset and with
+     *              nothing else on the bus.
      */
     @Synchronized
-    fun arm(ctx: Context, scope: CoroutineScope, sec: Long, then: Long = 0L): String {
+    fun arm(ctx: Context, scope: CoroutineScope, sec: Long, then: Long = 0L, count: Int = 1): String {
         cancel()
         armedSec = sec.coerceIn(0, 600)
         armedThen = then.coerceIn(0, 600)
+        armedCount = count.coerceIn(1, 10)
         lastResult = ""
-        DiagLog.info("applyat: armed — apply ${armedSec}s after the next aircraft session" +
-            if (armedThen > 0) ", then a second one ${armedThen}s later" else "")
+        DiagLog.info("applyat: armed — $armedCount apply(s), first ${armedSec}s after the next aircraft session" +
+            if (armedCount > 1) ", then every ${armedThen}s" else "")
         job = scope.launch {
             val startGen = FlyLink.generation
             // Wait for a session edge: a genuinely new aircraft, not the one already up.
@@ -54,32 +56,36 @@ object ApplyAt {
             DiagLog.info("applyat: aircraft session #${FlyLink.generation} — waiting ${armedSec}s")
             delay(armedSec * 1000)
             if (!isActive) return@launch
-            val waited = (System.currentTimeMillis() - linkedAt) / 1000
-            DiagLog.info("applyat: firing the single apply now (+${waited}s after the aircraft appeared)")
-            val ok = runCatching { Features(ctx).applyFcc() }.getOrDefault(false)
-            lastResult = "fired at +${waited}s, frames ${if (ok) "all sent" else "INCOMPLETE"}"
-            DiagLog.info("applyat: $lastResult")
-            if (armedThen > 0) {
-                delay(armedThen * 1000)
-                if (!isActive) return@launch
-                val waited2 = (System.currentTimeMillis() - linkedAt) / 1000
-                DiagLog.info("applyat: firing the SECOND apply now (+${waited2}s after the aircraft appeared)")
-                val ok2 = runCatching { Features(ctx).applyFcc() }.getOrDefault(false)
-                lastResult += "; second at +${waited2}s, frames ${if (ok2) "all sent" else "INCOMPLETE"}"
-                DiagLog.info("applyat: second apply done")
+            val parts = ArrayList<String>(armedCount)
+            for (i in 1..armedCount) {
+                if (i > 1) {
+                    delay(armedThen * 1000)
+                    if (!isActive) return@launch
+                }
+                val at = (System.currentTimeMillis() - linkedAt) / 1000
+                // State AT THE MOMENT OF FIRING, not at arming time. A run measured with
+                // the keepalive quietly running is not the run you think you ran, and
+                // that mistake cost a whole afternoon of "manual works, automatic does
+                // not" — the keepalive had restarted itself behind the measurement.
+                val contaminated = FccKeepaliveService.running
+                DiagLog.info("applyat: firing apply $i/$armedCount now (+${at}s after the aircraft appeared)" +
+                    if (contaminated) "  ⚠ KEEPALIVE IS RUNNING — this run is contaminated" else "")
+                val ok = runCatching { Features(ctx).applyFcc() }.getOrDefault(false)
+                parts += "#$i at +${at}s ${if (ok) "sent" else "INCOMPLETE"}"
             }
-            DiagLog.info("applyat: series complete — watch DJI Fly and report when 5.8 appears")
+            lastResult = parts.joinToString("; ")
+            DiagLog.info("applyat: series complete ($lastResult) — watch DJI Fly and report when 5.8 appears")
             armedSec = -1
         }
-        return "armed: apply at +${armedSec}s" + (if (armedThen > 0) " and +${armedSec + armedThen}s" else "") +
-            " after the next aircraft session (keepalive should be OFF)"
+        return "armed: $armedCount apply(s), first at +${armedSec}s" +
+            (if (armedCount > 1) ", every ${armedThen}s after" else "") + " (keepalive should be OFF)"
     }
 
     @Synchronized
-    fun cancel() { job?.cancel(); job = null; if (armedSec >= 0) DiagLog.info("applyat: disarmed"); armedSec = -1; armedThen = 0 }
+    fun cancel() { job?.cancel(); job = null; if (armedSec >= 0) DiagLog.info("applyat: disarmed"); armedSec = -1; armedThen = 0; armedCount = 1 }
 
     fun status(): String = when {
-        armedSec >= 0 -> "armed for +${armedSec}s" + (if (armedThen > 0) " and +${armedSec + armedThen}s" else "") + " after the next aircraft session"
+        armedSec >= 0 -> "armed: $armedCount apply(s) from +${armedSec}s" + (if (armedCount > 1) " every ${armedThen}s" else "")
         lastResult.isNotEmpty() -> "done — $lastResult"
         else -> "not armed"
     }

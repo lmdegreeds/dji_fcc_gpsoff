@@ -67,6 +67,7 @@ class FccKeepaliveService : Service() {
         loop?.cancel()
         activeMode = mode
         DiagLog.info("keepalive: mode = ${mode.label}")
+        warnIfBlind()
         loop = scope.launch {
             if (awaitProxy() <= 0) return@launch              // cancelled while waiting
             // Feed DroneLink from 40007 while Fly isn't foreground. Started on the
@@ -79,6 +80,31 @@ class FccKeepaliveService : Service() {
             maintain(features)                                // verify region on 40009 + re-apply on drift/relink
         }
         return START_STICKY
+    }
+
+    /**
+     * Say it loudly when auto-FCC is about to run without eyes.
+     *
+     * Android disables an accessibility service on every reinstall, and nothing used
+     * to mention it. The keepalive then keeps applying on its bare timers: it cannot
+     * see the aircraft appear, so it fires whenever, not when the aircraft is ready.
+     * That cost nine consecutive test applies before anyone thought to check the one
+     * status field that showed it — a field nobody reads while the app looks healthy.
+     */
+    private fun warnIfBlind() {
+        val on = runCatching {
+            val expected = android.content.ComponentName(this, DjiFlyAccessibilityService::class.java)
+            android.provider.Settings.Secure.getString(
+                contentResolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ).orEmpty().split(':')
+                .mapNotNull(android.content.ComponentName::unflattenFromString)
+                .any { it == expected }
+        }.getOrDefault(false)
+        if (!on) DiagLog.warn(
+            "keepalive: ACCESSIBILITY SERVICE IS OFF — the aircraft-link detector is dead, so FCC " +
+            "is applied on bare timers instead of when the drone appears. Android switches this off " +
+            "on every reinstall. Enable it in Android settings → Accessibility."
+        )
     }
 
     /**
