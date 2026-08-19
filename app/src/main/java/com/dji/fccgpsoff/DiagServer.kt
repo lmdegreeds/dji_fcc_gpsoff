@@ -683,6 +683,26 @@ object DiagServer {
                     note = query(path, "note"),
                 )
                 "/exp/log" -> Experiment.log(appCtx)
+                // Opens Android's "App info" page for DJI Fly, where Force stop and Open
+                // are one tap each. A persistence run needs Fly restarted between the
+                // apply and the reading, and hunting that screen down by hand every round
+                // is most of the round. No accessibility involved — a plain settings
+                // intent; we only launch it, the taps stay the operator's.
+                "/flyinfo" -> {
+                    val pkg = query(path, "pkg")
+                        ?: ForegroundGate.DJI_PACKAGES.firstOrNull { p ->
+                            runCatching { appCtx.packageManager.getPackageInfo(p, 0) }.isSuccess
+                        }
+                    if (pkg == null) "no DJI package installed"
+                    else runCatching {
+                        appCtx.startActivity(
+                            android.content.Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                android.net.Uri.parse("package:$pkg"),
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                        "opened App info for $pkg — tap Force stop, then Open"
+                    }.getOrElse { "could not open App info: ${it.message}" }
+                }
                 // Experiment harness: fire EXACTLY ONE apply, `sec` seconds after the
                 // next aircraft session appears on DJI Fly's screen, and nothing else.
                 //
