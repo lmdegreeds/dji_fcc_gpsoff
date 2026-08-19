@@ -743,6 +743,7 @@ class MainActivity : Activity() {
             addView(smallBtn(t("📂 Из файла", "📂 From file"), BLUE) { pickCatalog() })
             next(smallBtn(t("📦 Из набора", "📦 From set"), GREEN) { pickBundledSet() })
             next(smallBtn(t("📡 С борта", "📡 From aircraft"), VIOLET) { dumpFromAircraft() })
+            next(smallBtn(t("📥 Значения", "📥 Values"), VIOLET) { readShownValues() })
             next(smallBtn(t("⏹ Остановить Fly", "⏹ Stop Fly"), AMBER) { openFlyAppInfo() })
             next(smallBtn(t("▶ Открыть Fly", "▶ Open Fly"), GREEN) { openFly() })
         }
@@ -1195,10 +1196,150 @@ class MainActivity : Activity() {
         }
     }
 
+    /**
+     * Read the CURRENT value of every row the filters are showing, in batches.
+     *
+     * The catalog loads in a second and then every "Текущее" cell sits grey until
+     * someone taps `чтен.` on it one row at a time — which is the wrong shape for a
+     * list of hundreds. [ParamRead.readMany] puts sixteen asks in one 40007 window,
+     * the way [ParamTable]'s index walk already reads `03:E1`, so a filtered view of
+     * a few dozen parameters fills in within seconds rather than minutes.
+     *
+     * Scoped to what is on screen rather than the whole catalog on purpose: ~950
+     * names would be sixty windows on DJI Fly's video port, and the answer to "what
+     * does this aircraft hold" is nearly always about a handful of rows the user has
+     * already filtered down to.
+     */
+    private fun readShownValues() {
+        val rows = paramRows
+        if (rows.isEmpty()) {
+            setStatus(t("нечего читать — список пуст", "nothing to read — the list is empty")); return
+        }
+        if (!ForegroundGate.readsAllowed()) {
+            setStatus(t("⚠ DJI Fly на переднем плане — переключитесь в это приложение и повторите",
+                        "⚠ DJI Fly is active — switch to this app and retry"))
+            return
+        }
+        val names = rows.map { it.name }
+        val go = {
+            val progress = TextView(this).apply {
+                setTextColor(MUTED); textSize = 13f; setPadding(dp(20), dp(16), dp(20), dp(8))
+                text = t("читаю…", "reading…")
+            }
+            val dlg = android.app.AlertDialog.Builder(this)
+                .setTitle(t("Чтение значений с борта", "Reading values from the aircraft"))
+                .setView(progress).setCancelable(false).create()
+            dlg.show()
+            scope.launch {
+                val got = runCatching {
+                    ParamRead.readMany(names) { done, total ->
+                        runOnUiThread {
+                            progress.text = t("прочитано $done из $total", "read $done of $total")
+                        }
+                    }
+                }.getOrDefault(emptyMap())
+                runOnUiThread {
+                    runCatching { dlg.dismiss() }
+                    // File every answer into the live map so the rows turn green, then
+                    // redraw once — not once per value.
+                    for (d in rows) got[d.name]?.let { paramLive[d.name] = ParamCatalog.decode(it, d.typeName) }
+                    if (::paramTable.isInitialized) paramAdapter.notifyDataSetChanged()
+                    setStatus(when {
+                        got.isEmpty() -> t("⚠ ни один параметр не ответил — дрон выключен, не на связи, или мешает DJI Fly",
+                                           "⚠ nothing answered — the drone is off, not linked, or DJI Fly is in the way")
+                        got.size < names.size -> t("✅ прочитано ${got.size} из ${names.size} · остальные не ответили",
+                                                   "✅ read ${got.size} of ${names.size} · the rest did not answer")
+                        else -> t("✅ прочитаны все ${got.size}", "✅ all ${got.size} read")
+                    })
+                }
+            }
+        }
+        // A big filtered set is a long run on DJI Fly's port, so say how long before
+        // starting one. A short list just goes.
+        if (names.size <= VALUES_ASK_ABOVE) { go(); return }
+        val windows = (names.size + 15) / 16
+        android.app.AlertDialog.Builder(this)
+            .setTitle(t("Прочитать значения", "Read the values"))
+            .setMessage(t(
+                "Показано ${names.size} параметров — это примерно $windows окон чтения по порту DJI Fly, " +
+                    "около ${windows * 2} с. Сузьте поиск или группу, если нужно быстрее.",
+                "${names.size} parameters are shown — about $windows read windows on DJI Fly's port, " +
+                    "roughly ${windows * 2}s. Narrow the search or the group for a faster run."))
+            .setNegativeButton(t("Отмена", "Cancel"), null)
+            .setPositiveButton(t("Читать", "Read")) { _, _ -> go() }
+            .show()
+    }
+
+    /**
+     * The dialog's own numeric keypad.
+     *
+     * The system IME is the wrong tool here twice over. It offers a full alphabetic
+     * keyboard for a field that takes a decimal or `0x` hex — and on this short
+     * landscape screen it covers the dialog's Write button, which cannot be scrolled
+     * to, while a tap outside to dismiss the keyboard dismisses the dialog with it.
+     * So there was no way to type a value and then write it (reported 2026-08-19).
+     *
+     * A pad drawn inside the dialog has none of those problems: nothing overlaps,
+     * nothing to dismiss, and the keys are exactly the alphabet a value can use —
+     * digits, a decimal point, a minus, `0x` and the hex letters that follow it.
+     */
+    private fun valueKeypad(input: EditText): View {
+        fun insert(sub: String) {
+            val e = input.text
+            val a = minOf(input.selectionStart, input.selectionEnd).coerceAtLeast(0)
+            val b = maxOf(input.selectionStart, input.selectionEnd).coerceAtLeast(0)
+            e.replace(a, b, sub)
+            input.setSelection((a + sub.length).coerceAtMost(input.text.length))
+        }
+        fun key(label: String, fill: Int, onTap: () -> Unit) = Button(this).apply {
+            text = label; isAllCaps = false; textSize = 15f; setTextColor(Color.WHITE)
+            typeface = Typeface.MONOSPACE
+            minHeight = dp(34); minimumHeight = dp(34); minWidth = 0; minimumWidth = 0
+            setPadding(0, dp(3), 0, dp(3)); background = pillBg(fill, dp(9)); stateListAnimator = null
+            setOnClickListener { onTap() }
+        }
+        fun row(vararg keys: View) = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            for ((i, k) in keys.withIndex()) addView(k, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f).apply {
+                if (i > 0) leftMargin = dp(4)
+                topMargin = dp(4)
+            })
+        }
+        fun digit(c: Char) = key(c.toString(), SLATE) { insert(c.toString()) }
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        col.addView(row(digit('7'), digit('8'), digit('9'), key("A", 0xFF232838.toInt()) { insert("A") },
+            key("B", 0xFF232838.toInt()) { insert("B") }, key("C", 0xFF232838.toInt()) { insert("C") },
+            key("⌫", CORAL) {
+                val a = minOf(input.selectionStart, input.selectionEnd).coerceAtLeast(0)
+                val b = maxOf(input.selectionStart, input.selectionEnd).coerceAtLeast(0)
+                if (b > a) { input.text.replace(a, b, ""); input.setSelection(a) }
+                else if (a > 0) { input.text.replace(a - 1, a, ""); input.setSelection(a - 1) }
+            }))
+        col.addView(row(digit('4'), digit('5'), digit('6'), key("D", 0xFF232838.toInt()) { insert("D") },
+            key("E", 0xFF232838.toInt()) { insert("E") }, key("F", 0xFF232838.toInt()) { insert("F") },
+            key("0x", BLUE) { insert("0x") }))
+        col.addView(row(digit('1'), digit('2'), digit('3'), digit('0'),
+            key(".", SLATE) { insert(".") }, key("-", SLATE) { insert("-") },
+            key(t("сброс", "clr"), 0xFF232838.toInt()) { input.setText(""); input.setSelection(0) }))
+        col.addView(TextView(this).apply {
+            text = t("десятичное · или 0x и байты в hex (младший байт первым)",
+                     "decimal · or 0x followed by hex bytes (low byte first)")
+            setTextColor(MUTED); textSize = 10f; setPadding(dp(2), dp(5), 0, 0)
+        })
+        return col
+    }
+
     private fun openParamEditor(d: ParamCatalog.Def) {
         val head = t("список: значение=${d.value} по умолч.=${d.def} диапазон=${d.range.ifEmpty { "нет" }} тип=${typeLabel(d)}",
                      "catalog: value=${d.value} default=${d.def} range=${d.range.ifEmpty { "none" }} type=${typeLabel(d)}")
-        val input = EditText(this).apply { hint = t("новое значение (десятичное или 0x..)", "new value (decimal or 0x..)"); setText(d.value) }
+        val input = EditText(this).apply {
+            hint = t("новое значение (десятичное или 0x..)", "new value (decimal or 0x..)")
+            setText(d.value)
+            // Never raise the system keyboard: [valueKeypad] below is the input method
+            // for this field. The cursor, selection and paste all still work.
+            showSoftInputOnFocus = false
+            setSelectAllOnFocus(true)
+        }
         val msg = TextView(this).apply { setTextColor(MUTED); textSize = 12f; setPadding(dp(6), dp(4), dp(6), dp(4))
             text = "$head\n" + t("текущее: читаю…", "current: reading…") }
         // A 4th action doesn't fit AlertDialog's three buttons, so Reset lives in
@@ -1207,7 +1348,7 @@ class MainActivity : Activity() {
         // only the fallback.
         val resetBtn = smallBtn(t("↺ Вернуть значение по умолчанию", "↺ Reset to default"), SLATE) {}
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(6), dp(12), 0)
-            addView(msg); addView(input); addView(resetBtn) }
+            addView(msg); addView(input); addView(valueKeypad(input)); addView(resetBtn) }
 
         // What 03:F7 said about this parameter, once it has answered.
         var boardInfo: ConfigTable.Info.Ok? = null
@@ -1325,10 +1466,15 @@ class MainActivity : Activity() {
                 }
                 .show()
         }
-        // A dialog has its own window and does not inherit the activity's soft-input mode,
-        // so it needs the same treatment: pan the value field above the keyboard instead of
-        // letting the keyboard cover it on this short landscape screen.
-        dlg.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN)
+        // The value field uses [valueKeypad], never the system IME, so nothing can cover
+        // the Write button — but say so to the window as well, in case a keyboard is
+        // raised some other way (an attached hardware keyboard, an accessibility IME).
+        dlg.window?.setSoftInputMode(android.view.WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_HIDDEN or
+            android.view.WindowManager.LayoutParams.SOFT_INPUT_ADJUST_PAN)
+        // A stray tap beside the dialog used to close it and throw away a typed value —
+        // on a controller held in two hands that is easy to do by accident. Closing is
+        // what the Close button is for.
+        dlg.setCanceledOnTouchOutside(false)
         dlg.show()
     }
     /** Show the exact bytes before writing a parameter, then write and report an
@@ -1701,11 +1847,16 @@ class MainActivity : Activity() {
     private fun checkUpdates(manual: Boolean) {
         if (manual) setStatus(t("⏳ проверяю обновления…", "⏳ checking for updates…"))
         scope.launch {
-            val res = Updater.check(currentVersion(), AppState.updatePrerelease)
+            // The signing fingerprint goes with the request: a release whose APK carries
+            // someone else's key cannot install over this build, and there is no point
+            // downloading it to find that out in the system installer.
+            val res = Updater.check(currentVersion(), AppState.updatePrerelease,
+                                    AppSignature.ownTag(applicationContext))
             AppState.setLastUpdateCheck(applicationContext, System.currentTimeMillis())
             runOnUiThread {
                 when (res) {
                     is Updater.Result.Available -> showUpdateDialog(res.release, res.current)
+                    is Updater.Result.Incompatible -> showIncompatibleUpdate(res.release, res.current)
                     is Updater.Result.UpToDate -> if (manual)
                         setStatus(t("✅ установлена последняя версия (${res.current})",
                                     "✅ you are on the latest version (${res.current})"))
@@ -1746,6 +1897,38 @@ class MainActivity : Activity() {
             .show()
     }
 
+    /**
+     * A newer release exists that this build cannot install: its APK is signed with
+     * a different key.
+     *
+     * Shown rather than hidden. The release IS out there, the user will see it on
+     * GitHub, and "the app says I am up to date while a newer version exists" is the
+     * kind of quiet wrongness this project does not ship. What it cannot do is
+     * pretend the update is installable — Android has no override for a signature
+     * change, so the only route is uninstall and reinstall, and that loses settings.
+     */
+    private fun showIncompatibleUpdate(r: Updater.Release, current: String) {
+        val body = t(
+            "Версия ${r.version} опубликована, но её APK подписан другим ключом, чем установленная " +
+                "${current}. Android не позволяет заменить приложение сборкой с другой подписью — " +
+                "обновиться «поверх» нельзя.\n\nФайл: ${r.apkName}\nВаша подпись: ${AppSignature.ownTag(applicationContext)}\n\n" +
+                "Чтобы перейти: удалите текущую версию и установите новую вручную. Настройки и " +
+                "выданные разрешения при этом потеряются.",
+            "Version ${r.version} is published, but its APK is signed with a different key than the " +
+                "installed ${current}. Android does not allow replacing an app with a differently-signed " +
+                "build, so there is no update-in-place.\n\nFile: ${r.apkName}\nYour signature: " +
+                "${AppSignature.ownTag(applicationContext)}\n\nTo move over: uninstall the current version and " +
+                "install the new one by hand. Settings and granted permissions are lost in the process.")
+        android.app.AlertDialog.Builder(this)
+            .setTitle(t("Обновление есть, но с другой подписью", "An update exists, but with another signature"))
+            .setMessage(body)
+            .setNegativeButton(t("Закрыть", "Close"), null)
+            .setPositiveButton(t("Открыть страницу релиза", "Open the release page")) { _, _ ->
+                openUrl("https://github.com/${Updater.REPO}/releases/tag/${r.tag}")
+            }
+            .show()
+    }
+
     private fun downloadAndInstall(r: Updater.Release) {
         setStatus(t("⏳ скачиваю ${r.tag}…", "⏳ downloading ${r.tag}…"))
         scope.launch {
@@ -1763,6 +1946,20 @@ class MainActivity : Activity() {
                 if (file == null) {
                     setStatus(t("⚠ не удалось скачать обновление — проверьте сеть",
                                 "⚠ could not download the update — check the network"))
+                    return@runOnUiThread
+                }
+                // Last gate before the installer, and the one that covers a release whose
+                // asset name carries no fingerprint (everything published before 1.1.1).
+                // The file is here now, so this is a fact rather than an inference.
+                AppSignature.mismatchReason(applicationContext, file)?.let { why ->
+                    runCatching { file.delete() }
+                    android.app.AlertDialog.Builder(this@MainActivity)
+                        .setTitle(t("Установить нельзя", "Cannot be installed"))
+                        .setMessage("⚠ " + why)
+                        .setPositiveButton(t("Понятно", "OK"), null)
+                        .show()
+                    setStatus(t("⚠ обновление не установлено — подпись не совпадает",
+                                "⚠ update not installed — signature mismatch"))
                     return@runOnUiThread
                 }
                 if (!canInstallPackages()) {
@@ -2050,6 +2247,9 @@ class MainActivity : Activity() {
         private const val LEAVING_BLOCK_MS = 3_000L
         /** Coalesce typing in the params search box (see [paramRenderTick]). */
         private const val PARAM_SEARCH_DEBOUNCE_MS = 200L
+        /** Above this many shown rows, "📥 Значения" says how long the run will take
+         *  before starting it — every window is traffic on DJI Fly's video port. */
+        private const val VALUES_ASK_ABOVE = 40
         /** How many times [readStateNow] comes back for values that did not answer.
          *  Each round is one 40007 read window per still-missing value; a value that is
          *  going to answer at all normally does within the first couple of rounds. */

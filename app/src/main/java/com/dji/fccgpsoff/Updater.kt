@@ -47,14 +47,30 @@ object Updater {
         val title: String,
         val notes: String,          // release body (markdown, shown as plain text)
         val apkUrl: String,
+        val apkName: String,
         val apkSize: Long,
         val prerelease: Boolean,
+        /**
+         * Whether the chosen asset is signed with OUR key, as far as its file name
+         * says: true = the name carries our tag, false = it carries someone else's,
+         * null = the name carries no tag at all (a release published before the tag
+         * existed). Only `false` is a reason to refuse — `null` is unknown, and
+         * unknown is settled after the download by [AppSignature.mismatchReason].
+         */
+        val signerMatch: Boolean?,
     )
 
     sealed interface Result {
         /** A strictly newer release than [current] is available. */
         data class Available(val release: Release, val current: String) : Result
         data class UpToDate(val current: String) : Result
+        /**
+         * A newer release exists but its APK is signed with a different key, so
+         * Android cannot install it over this build. Reported separately rather than
+         * swallowed: the release IS there, and the user is entitled to know why the
+         * app will not take it.
+         */
+        data class Incompatible(val release: Release, val current: String) : Result
         /** Reached GitHub but nothing usable (no releases, or none with an APK). */
         data class None(val reason: String) : Result
         data class Failed(val reason: String) : Result
@@ -67,10 +83,10 @@ object Updater {
      * [includePrerelease] also considers releases GitHub marks as pre-release.
      * Drafts are never considered — they have no public asset.
      */
-    suspend fun check(currentVersion: String, includePrerelease: Boolean): Result = withContext(Dispatchers.IO) {
+    suspend fun check(currentVersion: String, includePrerelease: Boolean, signerTag: String = ""): Result = withContext(Dispatchers.IO) {
         val body = fetch(API) ?: return@withContext Result.Failed(
             t("не удалось связаться с GitHub", "could not reach GitHub"))
-        val all = runCatching { parse(JSONArray(body)) }.getOrNull()
+        val all = runCatching { parse(JSONArray(body), signerTag) }.getOrNull()
             ?: return@withContext Result.Failed(t("не удалось разобрать ответ GitHub", "could not parse the GitHub response"))
 
         val usable = all.filter { includePrerelease || !it.prerelease }
@@ -82,11 +98,45 @@ object Updater {
         // Newest by version, not by publish order: a patch to an older branch can
         // be published after a newer release.
         val newest = usable.maxWithOrNull { a, b -> compareVersions(a.version, b.version) }!!
-        if (compareVersions(newest.version, currentVersion) > 0) Result.Available(newest, currentVersion)
-        else Result.UpToDate(currentVersion)
+        if (compareVersions(newest.version, currentVersion) <= 0) return@withContext Result.UpToDate(currentVersion)
+        // A newer build that cannot replace this one is not an update offer. Say what it
+        // is instead of downloading megabytes the installer will refuse.
+        if (newest.signerMatch == false) Result.Incompatible(newest, currentVersion)
+        else Result.Available(newest, currentVersion)
     }
 
-    private fun parse(arr: JSONArray): List<Release> {
+    /**
+     * Pick the APK asset to offer from one release's assets.
+     *
+     * Names are `dji-fcc-gpsoff-<version>-<buildType>-<8 hex of the signing cert>.apk`
+     * since 2026-08-19 (`app/build.gradle.kts`). When [signerTag] is known and any
+     * asset carries it, that is the one — a release may legitimately carry both a
+     * release-key and a debug-key APK, and only one of them can install here.
+     * Otherwise fall back to the first APK and record what its name implies.
+     */
+    internal fun pickAsset(names: List<Pair<String, Pair<String, Long>>>, signerTag: String):
+            Triple<String, Pair<String, Long>, Boolean?>? {
+        if (names.isEmpty()) return null
+        if (signerTag.isNotEmpty()) {
+            names.firstOrNull { taggedWith(it.first, signerTag) }
+                ?.let { return Triple(it.first, it.second, true) }
+        }
+        val first = names.first()
+        // A name that carries SOME tag, just not ours, is a positive "different key".
+        // A name with no tag at all says nothing — settle it after the download.
+        val known = names.any { tagIn(it.first) != null }
+        return Triple(first.first, first.second, if (known && signerTag.isNotEmpty()) false else null)
+    }
+
+    private fun taggedWith(name: String, tag: String): Boolean = tagIn(name).equals(tag, ignoreCase = true)
+
+    /** The `-<8 hex>.apk` suffix of a build-stamped asset name, or null. */
+    internal fun tagIn(name: String): String? {
+        val m = Regex("-([0-9a-fA-F]{8})\\.apk$").find(name.trim()) ?: return null
+        return m.groupValues[1].lowercase()
+    }
+
+    private fun parse(arr: JSONArray, signerTag: String): List<Release> {
         val out = ArrayList<Release>(arr.length())
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
@@ -94,22 +144,25 @@ object Updater {
             val tag = o.optString("tag_name").trim()
             if (tag.isEmpty()) continue
             val assets = o.optJSONArray("assets") ?: continue
-            var url = ""; var size = 0L
+            val apks = ArrayList<Pair<String, Pair<String, Long>>>()
             for (j in 0 until assets.length()) {
                 val a = assets.optJSONObject(j) ?: continue
-                if (a.optString("name").endsWith(".apk", ignoreCase = true)) {
-                    url = a.optString("browser_download_url"); size = a.optLong("size", 0L); break
-                }
+                val n = a.optString("name")
+                if (n.endsWith(".apk", ignoreCase = true))
+                    apks.add(n to (a.optString("browser_download_url") to a.optLong("size", 0L)))
             }
-            if (url.isEmpty()) continue        // a release with no APK cannot be installed
+            val picked = pickAsset(apks, signerTag) ?: continue   // no APK ⇒ nothing to install
+            if (picked.second.first.isEmpty()) continue
             out.add(Release(
                 tag = tag,
                 version = tag.removePrefix("v").removePrefix("V"),
                 title = o.optString("name").ifBlank { tag },
                 notes = o.optString("body").trim(),
-                apkUrl = url,
-                apkSize = size,
+                apkUrl = picked.second.first,
+                apkName = picked.first,
+                apkSize = picked.second.second,
                 prerelease = o.optBoolean("prerelease", false),
+                signerMatch = picked.third,
             ))
         }
         return out

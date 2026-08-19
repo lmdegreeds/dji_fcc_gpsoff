@@ -168,6 +168,79 @@ object ParamRead {
     suspend fun read(name: String, attempts: Int = DEFAULT_ATTEMPTS): ByteArray? =
         readRaw(name, attempts)?.let { parseValue(it) }
 
+    /**
+     * Read MANY values in one pass — several `03:F8` asks per 40007 window instead
+     * of a window each.
+     *
+     * The wire supports this and it was measured: across 24 windows carrying 2 and 3
+     * requests, every window returned either ALL of its replies or none, and a paired
+     * ask answered in 91% of windows against a 70% solo baseline (see [DumlWindow]).
+     * [ParamTable]'s index walk already reads `03:E1` this way, 32 asks to a window;
+     * this is the same shape for values, so a catalog that loads in a second no longer
+     * needs a minute of one-at-a-time reads to show what the aircraft actually holds.
+     *
+     * Correlation is the ECHOED HASH, not the sequence number: the reply carries the
+     * hash it answers, every ask in a chunk has a different one, and other clients
+     * poll `03:F8` on this bus constantly. A non-zero status is not accepted — the
+     * payload then carries no hash to match on — so a refused read simply reads as
+     * unanswered, exactly as it does for a single read.
+     *
+     * Losses are per-window, so a second pass re-asks only what is still missing.
+     * [onProgress] fires per chunk; [ForegroundGate] is honoured between chunks and,
+     * inside [DumlWindow], mid-window.
+     */
+    suspend fun readMany(
+        names: List<String>,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): Map<String, ByteArray> = withContext(Dispatchers.IO) {
+        val out = HashMap<String, ByteArray>()
+        val wanted = names.distinct()
+        if (wanted.isEmpty()) return@withContext out
+        var todo = wanted
+        repeat(BATCH_PASSES) {
+            if (todo.isEmpty()) return@repeat
+            val missed = ArrayList<String>()
+            for (chunk in todo.chunked(BATCH_DEPTH)) {
+                if (!ForegroundGate.readsAllowed()) {
+                    DiagLog.warn("readMany: stopped — ${ForegroundGate.blockReason()}")
+                    return@withContext out
+                }
+                val asks = chunk.map { name ->
+                    val hash = DumlNative.nativeParamHash(name)
+                    DumlWindow.Ask("read $name 03:F8", request(hash)) { fr ->
+                        if (fr.cmdSet != DumlWire.CMDSET_FLYC ||
+                            fr.cmdId != DumlWire.CMDID_READ_PARAM_HASH || !fr.isResponse
+                        ) null
+                        else fr.payload.takeIf { pl ->
+                            pl.size >= 5 && pl[0].toInt() == 0 &&
+                                pl[1] == hash[0] && pl[2] == hash[1] && pl[3] == hash[2] && pl[4] == hash[3]
+                        }
+                    }
+                }
+                val got = DumlWindow.collect(DumlWire.PORT_LED, asks, BATCH_WINDOW_MS)
+                for (k in chunk.indices) {
+                    val v = got[k]?.let { parseValue(it) }
+                    if (v == null) missed.add(chunk[k]) else out[chunk[k]] = v
+                }
+                onProgress(out.size, wanted.size)
+                delay(BATCH_GAP_MS)
+            }
+            todo = missed
+            if (todo.isNotEmpty()) DiagLog.info("readMany: ${todo.size} of ${wanted.size} unanswered — re-asking")
+        }
+        DiagLog.info("readMany: ${out.size}/${wanted.size} values read")
+        out
+    }
+
+    /** Asks per window. Half of [ParamTable]'s 32 for `03:E1`: a value reply is the
+     *  wider frame of the two, and this runs while DJI Fly is merely backgrounded. */
+    private const val BATCH_DEPTH = 16
+    private const val BATCH_WINDOW_MS = 1500
+    /** Losses are per-WINDOW, so one re-ask of the missing set recovers most of a
+     *  window that dropped whole. A third pass buys little for the traffic. */
+    private const val BATCH_PASSES = 2
+    private const val BATCH_GAP_MS = 120L
+
     /** A read-back that answered, with how long after the write it was taken. */
     class ReadBack(val value: ByteArray, val afterMs: Int)
 
