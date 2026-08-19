@@ -657,9 +657,10 @@ object DiagServer {
                 // Minimal-sequence search: play a SUBSET of fcc_full.json and score the
                 // two visible effects by eye. See Experiment.kt for why the verdict
                 // is persisted and why a single negative run proves nothing.
-                "/frames" -> Experiment.frames(appCtx)
+                "/frames" -> Experiment.frames(appCtx, query(path, "profile"))
                 "/exp" -> runCatching {
-                    val keep = Experiment.select(appCtx, query(path, "keep"), query(path, "drop"))
+                    val profile = query(path, "profile")
+                    val keep = Experiment.select(appCtx, query(path, "keep"), query(path, "drop"), profile)
                     Experiment.start(
                         appCtx,
                         label = query(path, "label") ?: "exp",
@@ -670,6 +671,7 @@ object DiagServer {
                         // Apply FCC no longer sends the regulatory write (it never stuck), so the
                         // harness default matches the product: off unless explicitly asked for.
                         withReg = (query(path, "reg")?.toIntOrNull() ?: 0) != 0,
+                        profile = profile,
                     )
                 }.getOrElse { "bad subset: ${it.message}" }
                 "/exp/status" -> Experiment.status()

@@ -42,7 +42,57 @@ import java.io.File
 object Experiment {
 
     /** FreeFCC's original 21 frames. The shipped `fcc.json` is now one frame. */
-    private const val FULL_PROFILE = "fcc_full.json"
+    const val FULL_PROFILE = "fcc_full.json"
+
+    /**
+     * Which asset a run plays. Defaults to the 21-frame original; `ce_restore.json`
+     * exists so a persistence run can be reset WITHOUT power-cycling the aircraft —
+     * if CE takes effect live, which its own note doubts and which is worth testing,
+     * since the identical claim about FCC ("takes effect after a reboot") turned out
+     * to be wrong.
+     */
+    private fun asset(name: String?): String = when {
+        name.isNullOrBlank() -> FULL_PROFILE
+        name.startsWith(COUNTRY_PREFIX) -> name          // synthetic, never loaded from assets
+        name.endsWith(".json") -> name
+        else -> "$name.json"
+    }
+
+    /**
+     * `profile=country:XX` — the one frame the whole FCC switch turned out to be,
+     * with an arbitrary two-letter radio country instead of the hard-coded AU.
+     *
+     * `fcc.json` writes `07:30` with ASCII "AU" twice (2.4 and 5.8 channel groups).
+     * Since that single frame is the switch, the same frame with another code is its
+     * inverse — which is what a persistence run needs: a way back to CE that does not
+     * cost an aircraft power cycle. Synthetic rather than an asset per country: the
+     * codes the firmware knows are a short list (AU, CN, US, BO, RU, NL, MY) and each
+     * would otherwise be a near-identical file.
+     */
+    private const val COUNTRY_PREFIX = "country:"
+
+    private fun countryProfile(code: String): ProfileRunner.Profile {
+        val c = code.trim().uppercase()
+        require(c.length == 2 && c.all { it in 'A'..'Z' }) { "country must be two A-Z letters, got '$code'" }
+        val a0 = c[0].code.toByte(); val a1 = c[1].code.toByte()
+        // Same layout as fcc.json frame 6: code, two pad bytes, code again, two pad,
+        // then 01 00. Both groups carry the same code there, so both carry it here.
+        val payload = byteArrayOf(a0, a1, 0, 0, a0, a1, 0, 0, 1, 0)
+        return ProfileRunner.Profile(
+            name = "COUNTRY $c", port = DumlWire.PORT_FCC, wrapper = false, needsResponse = false,
+            rounds = 1, interFrameMs = 30, interRoundMs = 1000, readWindowMs = 50,
+            frames = listOf(ProfileRunner.Frame(
+                cmdSet = 0x07, cmdId = 0x30, dst = 9, payload = payload,
+                sender = DumlWire.SENDER_APP4, cmdType = DumlWire.CT_ACK_BEFORE,
+                note = "radio country -> $c")),
+        )
+    }
+
+    private fun profileOf(ctx: Context, name: String?): ProfileRunner.Profile {
+        val a = asset(name)
+        return if (a.startsWith(COUNTRY_PREFIX)) countryProfile(a.removePrefix(COUNTRY_PREFIX))
+               else ProfileRunner(ctx).load(a)
+    }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var job: Job? = null
@@ -67,8 +117,8 @@ object Experiment {
     private fun file(ctx: Context) = File(ctx.filesDir, "experiments.log")
 
     /** Frames of the full profile with the index that `keep=`/`drop=` address. */
-    fun frames(ctx: Context): String {
-        val p = ProfileRunner(ctx).load(FULL_PROFILE)
+    fun frames(ctx: Context, profile: String? = null): String {
+        val p = profileOf(ctx, profile)
         val sb = StringBuilder("${p.name}: ${p.frames.size} frames, rounds=${p.rounds}, port=${p.port}\n")
         p.frames.forEachIndexed { i, fr ->
             sb.append("%2d  %02X:%02X d=%-3d %-22s %s\n".format(
@@ -86,8 +136,8 @@ object Experiment {
      * profile is an error rather than a silent no-op — a typo in a subset would
      * otherwise be scored as a real result.
      */
-    fun select(ctx: Context, keep: String?, drop: String?): List<Int> {
-        val n = ProfileRunner(ctx).load(FULL_PROFILE).frames.size
+    fun select(ctx: Context, keep: String?, drop: String?, profile: String? = null): List<Int> {
+        val n = profileOf(ctx, profile).frames.size
         fun parse(s: String) = s.split(',').filter { it.isNotBlank() }.map {
             val v = it.trim().toIntOrNull() ?: throw IllegalArgumentException("not a frame index: '$it'")
             require(v in 0 until n) { "frame index $v out of range 0..${n - 1}" }
@@ -106,11 +156,11 @@ object Experiment {
      * which this deliberately mirrors rather than calls: the point of the harness
      * is to vary what applyFcc holds fixed.
      */
-    suspend fun applySubset(ctx: Context, keep: List<Int>, rounds: Int, withReg: Boolean): Boolean {
+    suspend fun applySubset(ctx: Context, keep: List<Int>, rounds: Int, withReg: Boolean, profile: String? = null): Boolean {
         val runner = ProfileRunner(ctx)
-        val full = runner.load(FULL_PROFILE)
+        val full = profileOf(ctx, profile)
         val sub = full.copy(
-            name = "SUBSET[${keep.joinToString(",")}]",
+            name = "${asset(profile).removeSuffix(".json").removePrefix(COUNTRY_PREFIX)}[${keep.joinToString(",")}]",
             rounds = rounds,
             frames = full.frames.filterIndexed { i, _ -> i in keep },
         )
@@ -133,16 +183,16 @@ object Experiment {
 
     /** Start a series of [count] applies of the subset, [gapSec] apart. */
     fun start(ctx: Context, label: String, keep: List<Int>, count: Int, gapSec: Int,
-              rounds: Int, withReg: Boolean): String {
+              rounds: Int, withReg: Boolean, profile: String? = null): String {
         if (job?.isActive == true) return "busy: a series is already running — /exp/cancel first"
         val run = Run(label, keep, count, gapSec, rounds, withReg, System.currentTimeMillis())
         current = run
-        DiagLog.info("experiment '$label': ${keep.size} frames [${keep.joinToString(",")}], " +
+        DiagLog.info("experiment '$label': ${asset(profile)} ${keep.size} frames [${keep.joinToString(",")}], " +
                      "rounds=$rounds reg=${if (withReg) 1 else 0}, $count applies every ${gapSec}s")
         job = scope.launch {
             repeat(count) { k ->
                 if (!isActive) { run.cancelled = true; return@launch }
-                val ok = runCatching { applySubset(ctx, keep, rounds, withReg) }.getOrDefault(false)
+                val ok = runCatching { applySubset(ctx, keep, rounds, withReg, profile) }.getOrDefault(false)
                 if (ok) run.sentOk++ else run.sentFail++
                 DiagLog.info("experiment '$label': apply ${k + 1}/$count ${if (ok) "sent" else "FAILED"}")
                 if (k < count - 1) delay(gapSec * 1000L)
