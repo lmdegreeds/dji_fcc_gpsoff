@@ -57,9 +57,14 @@ class Features(ctx: Context) {
      * It used to be FreeFCC's 21-frame sequence played twice, followed by a
      * name-addressed `ce_regulatory_level` write. Frame-subset experiments on
      * 2026-08-19 (RC 2 + Lito X1, doc/fcc-minimal-sequence.md) cut all of that:
-     * this single frame raises transmit power AND enables 5.8 GHz on the first
-     * apply. The second round was a duplicate, and the regulatory write never
-     * stuck — it reads back `ff` whether FCC is on or off.
+     * this one frame raises transmit power AND enables 5.8 GHz, and the
+     * regulatory write never stuck — it reads back `ff` whether FCC is on or off.
+     *
+     * The frame is sent EIGHT times, one second apart (fcc.json `rounds`, one
+     * connection per round). A single send is not enough on a live session: it
+     * failed over 20 s of watching, twice, while a one-second burst landed on the
+     * 3rd and 4th shot. Two sends 100 ms apart in one connection also failed, so
+     * what the aircraft wants is separate sends spaced in time.
      *
      * Persistent within a flight session: the change survives until the aircraft
      * is power-cycled for real. A short "reboot" that does not fully cut power
