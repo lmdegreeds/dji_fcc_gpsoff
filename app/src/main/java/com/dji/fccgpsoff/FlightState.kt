@@ -24,6 +24,53 @@ object FlightState {
      *  probed but silent (no drone / link down), null = not probed (gate closed). */
     @Volatile var connected: Boolean? = null; private set
 
+    /**
+     * One of the three values this object holds, so a caller can read them ONE AT
+     * A TIME and keep going until each has actually answered.
+     *
+     * Added 2026-08-19 with the "Read state" fix: [refresh] reads all three in one
+     * pass and gives up on whichever did not answer, which is what left the panel
+     * sitting on "reading…" with nothing behind it. The UI now retries per item,
+     * and per item it needs to know what is still missing.
+     */
+    enum class Item(val label: String) {
+        LED("LED"), GPS("GPS"), MODE("mode");
+
+        fun paramName(): String = when (this) {
+            LED -> ParameterAddress.FOREARM_LED.name()
+            GPS -> ParameterAddress.GPS_ENABLE.name()
+            MODE -> ParameterAddress.FLIGHT_MODE.name()
+        }
+    }
+
+    /** Which of the three have never answered — what a "keep reading" loop still owes. */
+    fun missing(): List<Item> = Item.values().filter {
+        when (it) { Item.LED -> ledOn == null; Item.GPS -> gpsOn == null; Item.MODE -> cine == null }
+    }
+
+    /**
+     * Read exactly ONE value. Returns true when it answered.
+     *
+     * Same accounting as [refresh] for the value that did answer (it also proves a
+     * drone is on the link), but a silent read here is NOT recorded as
+     * `connected = false`: this is a per-item retry, and one unanswered item among
+     * three says nothing about the link. Only [refresh], which asks for all three,
+     * is entitled to that verdict.
+     */
+    suspend fun refreshOne(item: Item): Boolean {
+        if (!ForegroundGate.readsAllowed()) return false
+        val v = ParamRead.read(item.paramName()) ?: return false
+        when (item) {
+            Item.LED -> ledOn = valueOn(v)
+            Item.GPS -> gpsOn = valueOn(v)
+            Item.MODE -> if (v.isEmpty()) return false
+                         else cine = (v[0].toInt() and 0xFF) == (ParameterAddress.MODE_CINE.toInt() and 0xFF)
+        }
+        readsWork = true; connected = true; probed = true
+        lastMs = System.currentTimeMillis()
+        return true
+    }
+
     /** Read LED/GPS/mode, each with ParamRead's own retries — the reliable path (the
      *  FC's replies on 40007 are racy, so per-param retries matter). Reads abort the
      *  instant DJI Fly takes the foreground (ParamRead's strict gate). `connected` =
@@ -40,6 +87,20 @@ object FlightState {
         probed = true
         lastMs = System.currentTimeMillis()
         return any
+    }
+
+    /**
+     * Record that a full read round asked for every value and got nothing back while
+     * the read gate stayed open — which is the same verdict [refresh] reaches, and
+     * the only honest one: the flight controller answers a hash read whenever a drone
+     * is linked, so total silence means no drone on the link.
+     *
+     * Separate from [refreshOne] on purpose: one silent item among three says nothing
+     * about the link, so only a caller that asked for ALL of them may conclude this.
+     */
+    fun markSilent() {
+        connected = false; probed = true
+        lastMs = System.currentTimeMillis()
     }
 
     /** Drop all live state — called when the linked aircraft changes so readings

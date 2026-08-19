@@ -52,7 +52,8 @@ class Features(ctx: Context) {
 
     /**
      * Switch radio CE→FCC with ONE write: `07:30` to receiver 9, payload
-     * `41550000415500000100` (fcc.json).
+     * `41550000415500000100` (fcc.json) — where `4155` is the ASCII country and
+     * comes from [AppState.fccRegion] (AU unless the user picked another).
      *
      * It used to be FreeFCC's 21-frame sequence played twice, followed by a
      * name-addressed `ce_regulatory_level` write. Frame-subset experiments on
@@ -72,7 +73,8 @@ class Features(ctx: Context) {
      * was lost.
      */
     suspend fun applyFcc(): Boolean {
-        DiagLog.info("applyFcc: one frame 07:30 (fcc.json)")
+        val region = AppState.fccRegion
+        DiagLog.info("applyFcc: one frame 07:30 (fcc.json) · region " + region.display())
         // Short timeout on purpose: the lock's 3 s default let a second apply QUEUE
         // behind the first and run back to back. Measured on hardware — a keepalive
         // apply, an overlay tap and a session-edge apply once stacked into three
@@ -85,7 +87,7 @@ class Features(ctx: Context) {
             // Honest result: the frame had to leave the socket. A write that never
             // went out is a failed apply — do not report "FCC applied" for it.
             // Cf. FreeFCC 099081c.
-            val ok = runner.run(runner.load("fcc.json"), alreadyLeased = true).sent
+            val ok = runner.run(FccRegion.patch(runner.load("fcc.json"), region), alreadyLeased = true).sent
             if (!ok) DiagLog.warn("applyFcc: frame did not leave the socket — not applied")
             ok
         } finally { lastApplyFinishedMs = System.currentTimeMillis(); lease.close() }

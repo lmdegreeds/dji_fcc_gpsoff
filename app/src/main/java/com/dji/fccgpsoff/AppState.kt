@@ -35,6 +35,9 @@ object AppState {
     @Volatile var updatePrerelease = false
     /** When the last check ran, so a launch does not hit the API every time. */
     @Volatile var lastUpdateCheckMs = 0L
+    /** Radio country every FCC command writes. AU is what every hardware-confirmed
+     *  run used; the rest of the list is what the firmware was seen to take. */
+    @Volatile var fccRegion = FccRegion.DEFAULT
 
     /**
      * Which wizard step to resume on — persisted, not just held in the Activity.
@@ -73,6 +76,7 @@ object AppState {
         autoUpdateCheck = p.getBoolean("auto_update_check", true)
         updatePrerelease = p.getBoolean("update_prerelease", false)
         lastUpdateCheckMs = p.getLong("last_update_check", 0L)
+        fccRegion = FccRegion.of(p.getString("fcc_region", null))
         recordsTree = p.getString("records_tree", null)
         overlayX = p.getInt("overlay_x", -1)
         overlayY = p.getInt("overlay_y", -1)
@@ -113,6 +117,11 @@ object AppState {
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putInt("wizard_step", v).commit()
     }
     fun setAutoOverlay(ctx: Context, v: Boolean) { autoOverlay = v; put(ctx, "auto_overlay", v) }
+    fun setFccRegion(ctx: Context, v: FccRegion) {
+        fccRegion = v
+        ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString("fcc_region", v.code).apply()
+        DiagLog.info("FCC region: " + v.display())
+    }
     fun setRecordsTree(ctx: Context, v: String?) {
         recordsTree = v
         ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit().putString("records_tree", v).apply()

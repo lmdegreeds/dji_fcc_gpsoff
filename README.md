@@ -55,7 +55,8 @@ the system screen it opens — and finishes by asking which services to start no
 | **Accessibility** | recommended | Gates every read on DJI Fly's video port so it can never blip the video, and reads the aircraft model off Fly's screen |
 | **Install unknown apps** | optional | Lets the app install its own updates later |
 | **Flight logs / recordings** | optional | Folder access for the log download and video pages of the web dashboard |
-| **Services** | — | Auto FCC, floating menu, web dashboard — "start now" and "autostart" are set separately |
+| **Parameter names** | — | Short (Lito X1) or long `g_config.*` — by hand, or auto-detected with the aircraft powered up |
+| **What to enable** | — | Auto FCC, floating menu, web dashboard — one switch per service (runs it and arms its auto-start) |
 
 Everything after the first page can be skipped; the app works with every optional grant declined, with
 honest degradations shown in the UI. Language is switchable in the wizard's header, and the wizard can be
@@ -64,16 +65,26 @@ re-opened any time from the ⋮ menu.
 ## Using it
 
 1. Power up the aircraft and let DJI Fly show a live link.
-2. The app probes which parameter-name variant the aircraft answers to and sets the **device profile**
-   itself — *Lito X1* (short names) or *Other DJI* (`g_config.*` / `c1_*`). The result is remembered per
-   serial. It can be overridden on the Services page; a wrong profile makes the regulatory write silently
-   ineffective.
+2. Pick the **device profile** — *Lito X1* (short names) or *Other DJI* (`g_config.*` / `c1_*`). The setup
+   wizard asks for it on its own step and can detect it for you with the aircraft powered and linked; later
+   it lives in **⋮ → Settings**. The result is remembered per serial. There is no probe on every launch any
+   more — it cost FCC frames on DJI Fly's port (2026-08-19). FCC itself does not depend on the profile: the
+   power and 5.8 GHz frames are addressed by radio receiver and hardware register, not by parameter name.
+   LED, GPS, ATTI/Cine and writes from the parameter editor do.
 3. Press **⚡ Enable FCC**, or turn on **Auto FCC** and let the keepalive apply it on every connect.
 4. Verify in DJI Fly → **Transmission**: the band choice and the power graph appear immediately, no reboot.
    Allow up to ~20 s for the write to land.
 
+**FCC region** — the country code that goes out as the ASCII bytes of the `07:30` frame is chosen in
+**⋮ → Settings**: `AU`, `CN`, `US`, `BO`, `RU`, `NL`, `MY`, the codes the firmware accepts. `AU` is the
+default and the only one the switch has been confirmed with on hardware. The chosen code is used everywhere —
+a manual apply, auto FCC, and the floating menu's button.
+
 **Floating menu** — a ≡ handle over DJI Fly with GPS / LED / flight-mode toggles that fire without leaving
-Fly. Needs the "display over other apps" permission.
+Fly. Needs the "display over other apps" permission. The parameter editor has a **"Menu"** column: up to six
+of your own parameters can be pinned into that same panel. Their buttons come from the parameter's own limits
+(`ON`/`OFF` for a 0/1 parameter, otherwise `min` / `def` / `max`), because a window over Fly cannot take
+keyboard input.
 
 **Parameter editor** — get a list with **📂 From file** (a dronehack `.dhp` / `.dhv2params` export),
 **📦 From set** (bundled in the APK) or **📡 From aircraft** (reads the whole table over the radio, ~2 min —
@@ -84,11 +95,11 @@ nowhere.
 **Back the aircraft's parameters up with DJI Assistant 2 over USB first**: there is no undo here, and the
 originals are the only way back.
 
-**Web dashboard** — enable it in the app and open `http://<rc-ip>:8899/` (the main screen shows the URL; the
+**Web dashboard** — enable it in **⋮ → Diagnostics** and open `http://<rc-ip>:8899/` (the URL is shown there; the
 IP changes across reboots). `curl .../help` lists every raw endpoint. It binds `0.0.0.0:8899` with **no
 authentication** — a debug tool for a trusted LAN; turn it off when done.
 
-**Updates** — checked against GitHub on launch (at most every 6 h) when enabled on the Services page. A newer
+**Updates** — checked against GitHub on launch (at most every 6 h) when enabled in **⋮ → Settings**. A newer
 release opens a dialog with its release notes; nothing is downloaded or installed without confirmation.
 Pre-releases are only offered if you opt in.
 

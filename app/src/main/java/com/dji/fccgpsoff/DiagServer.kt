@@ -25,7 +25,8 @@ import kotlinx.coroutines.runBlocking
  *   GET  /stats               native transport counters
  *   GET  /ports               loopback DUML port scan
  *   GET  /connect             start the persistent main channel
- *   GET  /fcc                 apply FCC (one frame 07:30 — fcc.json)
+ *   GET  /fcc                 apply FCC (one frame 07:30 — fcc.json, country = /region)
+ *   GET  /region[?set=XX]     read / set the radio country every FCC command writes
  *   GET  /keepon?mode=        start the keepalive (mode=home_point|periodic)
  *   GET  /keepoff             stop the keepalive
  *   GET  /homepoint           passive 03:44 home-point state (the event trigger)
@@ -445,6 +446,7 @@ object DiagServer {
             "\"keepaliveRunning\":${FccKeepaliveService.running}," +
             "\"keepaliveActiveMode\":\"${FccKeepaliveService.activeMode?.wire ?: ""}\"," +
             "\"overlayRunning\":${OverlayService.running},\"diagRunning\":$isRunning," +
+            "\"fccRegion\":\"${AppState.fccRegion.code}\",\"fccRegionLabel\":${Json.quote(AppState.fccRegion.label)}," +
             "\"a11y\":${ForegroundGate.accessibilityConnected}}"
 
     /**
@@ -761,11 +763,44 @@ object DiagServer {
                         " (variant=${StartupProbe.variant}" +
                         (if (StartupProbe.variant == null) ", undecided — profile left as it was" else "") + ")"
                 }
+                // One switch per service, same as the app: setting a flag also RUNS or
+                // STOPS the service. Since 2026-08-19 the two are one control everywhere,
+                // and a dashboard that only armed the flag could put the app's switch out
+                // of step with what is actually running.
                 "/setauto" -> {
-                    query(path, "ka")?.let { AppState.setAutoKeepalive(appCtx, it == "1") }
-                    query(path, "ov")?.let { AppState.setAutoOverlay(appCtx, it == "1") }
-                    query(path, "diag")?.let { AppState.setAutoDiag(appCtx, it == "1") }
-                    "auto-start: keepalive=${AppState.autoKeepalive} overlay=${AppState.autoOverlay} diag=${AppState.autoDiag}"
+                    query(path, "ka")?.let {
+                        val on = it == "1"
+                        AppState.setAutoKeepalive(appCtx, on)
+                        if (on) FccKeepaliveService.start(appCtx) else FccKeepaliveService.stop(appCtx)
+                    }
+                    query(path, "ov")?.let {
+                        val on = it == "1"
+                        AppState.setAutoOverlay(appCtx, on)
+                        if (on) OverlayService.start(appCtx) else OverlayService.stop(appCtx)
+                    }
+                    query(path, "diag")?.let {
+                        val on = it == "1"
+                        AppState.setAutoDiag(appCtx, on)
+                        // Not stopping ourselves here: this very request is being served by
+                        // the diag server, and tearing it down mid-response would drop the
+                        // reply the dashboard is waiting for. DiagService.stop is the app's
+                        // job; the flag is what a browser can honestly change.
+                        if (on) DiagService.start(appCtx)
+                    }
+                    "services: keepalive=${AppState.autoKeepalive} overlay=${AppState.autoOverlay} diag=${AppState.autoDiag}"
+                }
+                // The radio country every FCC command writes. Read with no argument;
+                // ?set=XX picks one of FccRegion's codes (an unknown code is refused
+                // rather than written — the radio would silently ignore it).
+                "/region" -> {
+                    val want = query(path, "set")
+                    if (want == null) "region: ${AppState.fccRegion.display()} · known: " +
+                        FccRegion.values().joinToString(" ") { it.code }
+                    else {
+                        val r = FccRegion.values().firstOrNull { it.code.equals(want.trim(), true) }
+                        if (r == null) "unknown region '$want' — known: " + FccRegion.values().joinToString(" ") { it.code }
+                        else { AppState.setFccRegion(appCtx, r); "region set to ${r.display()}" }
+                    }
                 }
                 "/appstate" -> appStateJson()
                 "/state" -> { FlightState.refresh(); FlightState.statusJson() }
@@ -909,7 +944,7 @@ object DiagServer {
                         "/frames /exp?keep=|drop=&label=&count=&gap=&rounds=&reg= /exp/status /exp/cancel /exp/verdict?power=&r58=&note= /exp/log " +
                         "/foreground /identity /identity/forget /model /rc /screen /a11y " +
                         "/keepon?mode=home_point|periodic /keepoff /overlayon /overlayoff " +
-                        "/profile?lito=1|0 /setauto?ka=&ov=&diag= /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +
+                        "/profile?lito=1|0 /setauto?ka=&ov=&diag= /region[?set=AU] /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +
                         "/ledon /ledoff /gpson /gpsoff /deviceinfo /serial[?live=1] /readparams /clear " +
                         "/params.json?q=&limit=&edit=1&group= /params/read[.json]?name= /params/write?name=&value= " +
                         "/params/info[.json]?name= /params/reset?name=[&fallback=1] /profile/detect " +
