@@ -1,6 +1,7 @@
 {
   "name": "FCC",
   "_source": "Two frames, cut from FreeFCC's 21 by subset experiments on RC 2 + Lito X1, 2026-08-19. See doc/fcc-minimal-sequence.md. The 21-frame original is kept beside this file as fcc_full.json.",
+  "_order": "07:30 FIRST, then 09:27 — the order every passing run used (the harness plays fcc_full.json in index order, where 07:30 is frame 6 and the SDR register is frame 8). Shipping them the other way round on 2026-08-19 gave transmit power and NO 5.8, on hardware, repeatedly. Do not reorder.",
   "_roles": "The two effects have SEPARATE owners, each verified alone: 09:27 (SDR register 0xffff0048=2, setForceFcc) raises transmit power and gives no 5.8; 07:30 (WIFI channel group, ASCII AU twice) gives the 5.8 band. Both are needed for the full switch.",
   "_why_not_fewer": "07:30 alone switches BOTH live but does NOT survive a DJI Fly restart. Adding this one SDR register makes it survive. Region set + commit (06:72), the AUTOTEST service-mode wrapper (10:58), RADIO param (06:8C), the channel map/flag (07:18/07:19), the second SDR register (0xffff0063=3) and every flight-controller parameter write were each tested and dropped — none is needed.",
   "_cadence": "EIGHT sends, one second apart (rounds=8, inter_round_delay_ms=1000 — ProfileRunner opens a fresh connection per round). A single send does not take on a live session: measured 2026-08-19, it failed over 20 s of watching, twice, while a one-second burst landed on the 3rd and 4th shot. Two sends 100 ms apart inside one connection did NOT work, so what matters is separate sends spaced in time.",
@@ -15,7 +16,7 @@
   "read_window_ms": 50,
   "port": 40009,
   "frames": [
-    { "s": 9, "i": 39, "d": 9, "p": "00024800ffff0200000000", "note": "SDR reg 0xffff0048=2 setForceFcc — transmit power" },
-    { "s": 7, "i": 48, "d": 9, "p": "41550000415500000100", "note": "WIFI channel group AU — the 5.8 band" }
+    { "s": 7, "i": 48, "d": 9, "p": "41550000415500000100", "note": "WIFI channel group AU — the 5.8 band" },
+    { "s": 9, "i": 39, "d": 9, "p": "00024800ffff0200000000", "note": "SDR reg 0xffff0048=2 setForceFcc — transmit power" }
   ]
 }
