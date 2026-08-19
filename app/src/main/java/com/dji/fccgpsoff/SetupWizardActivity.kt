@@ -23,6 +23,11 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 
 /**
  * First-run setup wizard, bilingual (RU/EN, seeded from the device locale and
@@ -48,16 +53,26 @@ class SetupWizardActivity : Activity() {
     private val GREEN = 0xFF22C993.toInt(); private val BLUE = 0xFF4C6FFF.toInt()
     private val SLATE = 0xFF2A3042.toInt(); private val AMBER = 0xFFF5A623.toInt()
 
-    private enum class Step { WELCOME, A11Y, INSTALL, FILES, SERVICES }
+    private enum class Step { WELCOME, A11Y, INSTALL, FILES, PROFILE, SERVICES }
 
     private var step = Step.WELCOME
 
-    // Service choices — "start now" and "add to autostart" are independent, so a
-    // user can arm autostart without starting anything in this session, or try a
-    // service once without arming it.
-    private var nowKeep = true;    private var autoKeep = true
-    private var nowOverlay = true; private var autoOverlay = true
-    private var nowDiag = false;   private var autoDiag = false
+    // Service choices. ONE flag each since 2026-08-19: a service is either wanted
+    // or not, and "wanted" means both "run it" and "bring it back next launch".
+    // Splitting those produced states nobody asked for — running but not armed,
+    // armed but not running — and the wizard is the worst place to offer them.
+    private var useKeep = true
+    private var useOverlay = true
+    private var useDiag = false
+
+    /** True once the user picked the name profile BY HAND on the profile step. A
+     *  hand-picked profile outranks the background probe that runs at finish — see
+     *  [finishWizard]. Cleared by a successful auto-detect: then the aircraft chose. */
+    private var profileManual = false
+
+    /** For the profile step's detection run. Kept off the finish-time probe, which is
+     *  deliberately detached (see [finishWizard]). */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private lateinit var body: LinearLayout
     private lateinit var title: TextView
@@ -71,9 +86,9 @@ class SetupWizardActivity : Activity() {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
         super.onCreate(savedInstanceState)
         AppState.load(applicationContext)
-        nowKeep = AppState.autoKeepalive; autoKeep = AppState.autoKeepalive
-        nowOverlay = AppState.autoOverlay; autoOverlay = AppState.autoOverlay
-        nowDiag = AppState.autoDiag; autoDiag = AppState.autoDiag
+        useKeep = AppState.autoKeepalive
+        useOverlay = AppState.autoOverlay
+        useDiag = AppState.autoDiag
         // Resume where the user was. Granting a special app access (notably "install
         // unknown apps") restarts our process, so coming back from that settings
         // screen re-enters onCreate — without this the wizard fell back to page 1.
@@ -140,6 +155,7 @@ class SetupWizardActivity : Activity() {
             Step.A11Y -> a11y()
             Step.INSTALL -> install()
             Step.FILES -> files()
+            Step.PROFILE -> profile()
             Step.SERVICES -> services()
         }
     }
@@ -254,25 +270,163 @@ class SetupWizardActivity : Activity() {
         footerBtns(back = true, skip = true)
     }
 
+    /**
+     * Which spelling of the flight-controller parameter names this aircraft uses.
+     *
+     * This step exists because the app stopped probing on its own (2026-08-19): a
+     * detection opens sockets on DJI Fly's port and needs a POWERED, LINKED drone,
+     * and every automatic probe was costing FCC when the user switched between this
+     * app and Fly. What remains is the finish-time probe, and at setup time the
+     * aircraft is usually still in its bag — so the probe finds nothing and the
+     * profile silently stays on the default.
+     *
+     * A wrong profile is not loud: every name-addressed write (LED, GPS, ATTI/Cine,
+     * the parameter editor's own defaults) goes out under a name the firmware does
+     * not have and is a no-op that still reports "sent". So it is asked here, with a
+     * default, an auto-detect for when the drone IS up, and the plain statement that
+     * Settings can change it later.
+     *
+     * FCC itself does not depend on any of this: the 07:30 / 09:27 frames are
+     * addressed by radio receiver and hardware register, never by parameter name.
+     */
+    private fun profile() {
+        head(t("Имена параметров дрона", "The aircraft's parameter names"))
+        para(t("Разные аппараты DJI называют одни и те же параметры по-разному. Lito X1 использует короткие имена " +
+               "(forearm_led_ctrl, gps_enable), большинство остальных — длинные формы g_config.*. " +
+               "Приложение пишет ровно одно имя, поэтому выбор должен быть верным.",
+               "DJI aircraft spell the same parameters differently. Lito X1 uses the short names " +
+               "(forearm_led_ctrl, gps_enable); most others use the long g_config.* forms. The app writes exactly " +
+               "one name, so this has to be right."))
+        choice(t("Короткие (Lito X1)", "Short (Lito X1)"), t("Длинные (g_config.*)", "Long (g_config.*)"),
+               AppState.litoMode) { lito ->
+            AppState.setLito(this, lito)
+            profileManual = true
+            render()
+        }
+        status(StartupProbe.variant != null,
+            t("определено опросом борта: ", "detected by asking the aircraft: ") +
+                (if (StartupProbe.variant == true) t("короткие", "short") else t("длинные", "long")),
+            if (profileManual) t("выбрано вручную", "picked by hand")
+            else t("борт ещё не опрашивался — стоит значение по умолчанию", "the aircraft has not been asked yet — this is the default"))
+        // What the same probe found besides the names. Shown here because this is the
+        // only step that talks to the aircraft, so it is where a user finds out whether
+        // the app can see the drone at all.
+        val serial = AircraftSession.serial.ifEmpty { StartupProbe.serial }
+        val model = AircraftIdentity.drone
+        note(t("Серийный номер: ", "Serial number: ") + serial.ifEmpty { "—" } +
+             "\n" + t("Модель дрона: ", "Aircraft model: ") +
+             (if (model.code.isEmpty()) t("— (определяется опросом или с экрана DJI Fly)",
+                                          "— (from the probe, or read off DJI Fly's screen)")
+              else "${model.name} [${model.code}]"))
+        note(t("На FCC этот выбор не влияет: кадры мощности и 5.8 ГГц адресуются радиоприёмнику и регистру, " +
+               "а не по имени параметра. От него зависят LED, GPS, ATTI/Cine и запись из редактора параметров.",
+               "It does not affect FCC: the power and 5.8 GHz frames are addressed by radio receiver and hardware " +
+               "register, not by parameter name. It does affect LED, GPS, ATTI/Cine and writes from the parameter editor."))
+        note(t("Это всегда можно изменить позже: ⋮ → Настройки → Профиль устройства.",
+               "You can change this at any time later: ⋮ → Settings → Device profile."))
+        act(t("🔍 Определить автоматически", "🔍 Detect automatically")) { detectProfile() }
+        footerBtns(back = true)
+    }
+
+    /**
+     * Run the real detection ([StartupProbe]) from the wizard, with its one
+     * precondition stated first: the drone must be powered and linked, because the
+     * flight controller only answers a hash read when it is. Saying that up front is
+     * cheaper than a failed probe the user has to interpret.
+     */
+    private fun detectProfile() {
+        android.app.AlertDialog.Builder(this)
+            .setTitle(t("Определить профиль", "Detect the profile"))
+            .setMessage(t("Включите дрон и дождитесь связи с пультом — без живого борта определять нечего: " +
+                          "имя проверяется запросом к полётному контроллеру.\n\n" +
+                          "DJI Fly при этом должен быть свёрнут или закрыт: это окно должно оставаться впереди. " +
+                          "Занимает несколько секунд.",
+                          "Power the aircraft on and wait for the link — with no live board there is nothing to " +
+                          "detect: the name is checked by asking the flight controller.\n\n" +
+                          "DJI Fly must be minimised or closed — this window has to stay in front. " +
+                          "Takes a few seconds."))
+            .setNegativeButton(t("Отмена", "Cancel"), null)
+            .setPositiveButton(t("Определить", "Detect")) { _, _ -> runDetectProfile() }
+            .show()
+    }
+
+    /**
+     * The one probe the wizard runs on demand, and it asks for everything the app
+     * can learn from a live aircraft in one visit: the serial ([StartupProbe]), the
+     * name variant, and the model over DUML ([AircraftModelProbe]).
+     *
+     * All three come off the same sockets on DJI Fly's port, so doing them together
+     * costs one burst instead of three — and the three answers are worth exactly one
+     * trip out to the field with the drone powered up.
+     */
+    private fun runDetectProfile() {
+        val dlg = android.app.AlertDialog.Builder(this)
+            .setTitle(t("Определяю…", "Detecting…"))
+            .setMessage(t("Опрашиваю борт: серийный номер, модель, имена параметров…",
+                          "Asking the aircraft: serial number, model, parameter names…"))
+            .setCancelable(false)
+            .show()
+        scope.launch {
+            runCatching { StartupProbe.run(applicationContext) }
+            // Model over DUML. Separate from StartupProbe because it is the one thing
+            // that has a second source (DJI Fly's own screen, via accessibility) and so
+            // is not part of the startup path's must-have set.
+            val modelNote = runCatching { AircraftModelProbe.capture(Features(applicationContext)) }
+                .getOrDefault("model probe failed")
+            DiagLog.info("wizard detect: $modelNote")
+            // Whatever the model probe resolved is worth keeping against this serial.
+            runCatching { StartupProbe.rememberModel(applicationContext) }
+            runOnUiThread {
+                runCatching { dlg.dismiss() }
+                val v = StartupProbe.variant
+                // A successful detection is the aircraft's own answer, so it is no
+                // longer a hand-picked value that has to outrank the finish-time probe.
+                if (v != null) profileManual = false
+                val serial = AircraftSession.serial.ifEmpty { StartupProbe.serial }
+                val found = buildString {
+                    append(t("Имена: ", "Names: ")).append(when (v) {
+                        true -> t("короткие (Lito X1)", "short (Lito X1)")
+                        false -> t("длинные g_config.*", "long g_config.*")
+                        else -> t("не подтвердились", "not confirmed")
+                    })
+                    append(t("\nСерийный номер: ", "\nSerial number: ")).append(serial.ifEmpty { "—" })
+                    append(t("\nМодель: ", "\nModel: ")).append(
+                        AircraftIdentity.drone.code.ifEmpty { "" }
+                            .let { if (it.isEmpty()) "—" else "${AircraftIdentity.drone.name} [$it]" })
+                }
+                toast(when {
+                    v != null -> found
+                    serial.isEmpty() ->
+                        t("Дрон не ответил. Включите его, дождитесь связи и повторите — или выберите профиль вручную.",
+                          "No answer from the aircraft. Power it on, wait for the link and retry — or pick a profile by hand.")
+                    else -> found + t("\n\nБорт на связи, но ни одно имя не подтвердилось — выберите профиль вручную.",
+                                      "\n\nThe board is linked but neither name was confirmed — pick a profile by hand.")
+                })
+                render()
+            }
+        }
+    }
+
     private fun services() {
-        head(t("Что запустить", "What to run"))
-        para(t("«Сейчас» запускает сервис прямо после мастера. «Автозапуск» поднимает его при старте приложения и " +
-               "после перезагрузки пульта. Эти переключатели независимы, и всё это можно изменить позже на странице " +
-               "Services.",
-               "\"Now\" starts the service right after the wizard. \"Autostart\" brings it up on app launch and after a " +
-               "controller reboot. The two are independent, and all of it can be changed later on the Services page."))
+        head(t("Что включить", "What to enable"))
+        para(t("Один переключатель на сервис: он запускает его сразу после мастера И поднимает при каждом старте " +
+               "приложения, в том числе после перезагрузки пульта. Всё это можно изменить позже — авто-FCC и " +
+               "плавающее меню на главной странице, веб-дашборд на странице «Диагностика».",
+               "One switch per service: it starts the service right after the wizard AND brings it up on every app " +
+               "launch, including after a controller reboot. All of it can be changed later — auto FCC and the " +
+               "floating menu on the Main page, the web dashboard on the Diagnostics page."))
 
         serviceRow("⚡ " + t("Авто-FCC", "Auto FCC"),
             t("Применяет FCC, как только дрон подключился, и удерживает его после релинка. Главная причина ставить " +
               "это приложение.",
               "Applies FCC as soon as the aircraft links up and keeps it across relinks. The main reason to install this."),
-            nowKeep, autoKeep, { nowKeep = it }, { autoKeep = it })
+            useKeep) { useKeep = it }
 
         val overlayOk = Settings.canDrawOverlays(this)
         serviceRow("🎈 " + t("Плавающее меню", "Floating menu"),
             t("Кнопка ≡ поверх DJI Fly с тумблерами GPS / LED / режим полёта.",
               "A ≡ handle over DJI Fly with GPS / LED / flight-mode toggles."),
-            nowOverlay, autoOverlay, { nowOverlay = it }, { autoOverlay = it })
+            useOverlay) { useOverlay = it }
         if (!overlayOk) {
             note(t("Нужно разрешение «Поверх других приложений» — без него меню не появится.",
                    "Needs the \"Display over other apps\" permission — without it the menu will not appear."))
@@ -284,7 +438,7 @@ class SetupWizardActivity : Activity() {
         serviceRow("🌐 " + t("Веб-дашборд", "Web dashboard"),
             t("HTTP-сервер на :8899 для браузера в той же сети. Без пароля — включайте только в доверенной сети.",
               "An HTTP server on :8899 for a browser on the same network. No password — enable it on a trusted LAN only."),
-            nowDiag, autoDiag, { nowDiag = it }, { autoDiag = it })
+            useDiag) { useDiag = it }
 
         footerBtns(back = true, next = t("Готово", "Done"))
     }
@@ -350,12 +504,18 @@ class SetupWizardActivity : Activity() {
         actions.addView(smallBtn(label, BLUE, onClick), lpH(right = 8))
     }
 
-    /** One service with independent "now" and "autostart" switches. */
-    private fun serviceRow(
-        name: String, desc: String,
-        now: Boolean, auto: Boolean,
-        onNow: (Boolean) -> Unit, onAuto: (Boolean) -> Unit,
-    ) {
+    /** Two mutually exclusive options as pills; the chosen one is filled green.
+     *  Rendered rather than toggled because a switch cannot say what "off" means when
+     *  both positions are a real answer. */
+    private fun choice(a: String, b: String, first: Boolean, onPick: (Boolean) -> Unit) {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        row.addView(smallBtn(a, if (first) GREEN else SLATE) { onPick(true) }, lpH(right = 8))
+        row.addView(smallBtn(b, if (first) SLATE else GREEN) { onPick(false) })
+        body.addView(row, lp(top = 2, bottom = 6))
+    }
+
+    /** One service, one switch: it both runs the service and arms its auto-start. */
+    private fun serviceRow(name: String, desc: String, on: Boolean, onSet: (Boolean) -> Unit) {
         val box = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL; background = pillBg(CARD, dp(14))
             setPadding(dp(12), dp(9), dp(12), dp(10))
@@ -367,10 +527,7 @@ class SetupWizardActivity : Activity() {
             text = desc; setTextColor(MUTED); textSize = 11.5f; setLineSpacing(dp(2).toFloat(), 1f)
             setPadding(0, dp(2), 0, dp(4))
         })
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        row.addView(toggle(t("Сейчас", "Now"), now, onNow), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        row.addView(toggle(t("Автозапуск", "Autostart"), auto, onAuto), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        box.addView(row)
+        box.addView(toggle(t("Включить · и запускать с приложением", "Enable · and start with the app"), on, onSet))
         body.addView(box, lp(bottom = 8))
     }
 
@@ -413,20 +570,44 @@ class SetupWizardActivity : Activity() {
     // ------------------------------------------------------------------- done
 
     private fun finishWizard() {
-        AppState.setAutoKeepalive(this, autoKeep)
-        AppState.setAutoOverlay(this, autoOverlay)
-        AppState.setAutoDiag(this, autoDiag)
+        // The ONE place that still probes the aircraft by itself. StartupProbe opens ~15
+        // sockets on 40007 (serial, name-variant, live state) and was removed from every
+        // automatic path on 2026-08-19 because that burst costs FCC whenever the user
+        // switches between this app and DJI Fly. Here it is worth it and safe: setup runs
+        // once, with the wizard in front and DJI Fly not in use, and the app needs the
+        // name-variant before any parameter write can be correct.
+        // Deliberately NOT tied to this Activity's life: the wizard finishes by launching
+        // MainActivity and closing, and cancelling the probe half-way would leave the
+        // name-variant undetected with nothing left to detect it.
+        // A profile the user picked BY HAND on the profile step outranks whatever this
+        // probe concludes — and it can only be pinned to an aircraft once the probe has
+        // found a serial to pin it to, which is why it is re-applied here rather than
+        // written on the step itself.
+        val manualLito = if (profileManual) AppState.litoMode else null
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            runCatching { StartupProbe.run(applicationContext) }
+            manualLito?.let { v ->
+                AppState.setLito(applicationContext, v)
+                AircraftSession.serial.ifEmpty { StartupProbe.serial }
+                    .takeIf { it.isNotEmpty() }
+                    ?.let { DeviceStore.setManualVariant(applicationContext, it, v) }
+            }
+        }
+        AppState.setAutoKeepalive(this, useKeep)
+        AppState.setAutoOverlay(this, useOverlay)
+        AppState.setAutoDiag(this, useDiag)
         // The wizard asked about accessibility properly; don't let MainActivity's
         // one-line fallback dialog ask again on the very next screen.
         AppState.setA11yPrompted(this, true)
         AppState.setWizardDone(this, true)
         AppState.setWizardStep(this, 0)   // a later re-run from the ⋮ menu starts at the top
 
-        if (nowKeep) FccKeepaliveService.start(this) else FccKeepaliveService.stop(this)
-        if (nowDiag) DiagService.start(this) else DiagService.stop(this)
-        if (nowOverlay && Settings.canDrawOverlays(this)) OverlayService.start(this)
+        if (useKeep) FccKeepaliveService.start(this) else FccKeepaliveService.stop(this)
+        if (useDiag) DiagService.start(this) else DiagService.stop(this)
+        if (useOverlay && Settings.canDrawOverlays(this)) OverlayService.start(this)
         else OverlayService.stop(this)
-        DiagLog.info("setup wizard: keepalive now=$nowKeep auto=$autoKeep · overlay now=$nowOverlay auto=$autoOverlay · diag now=$nowDiag auto=$autoDiag")
+        DiagLog.info("setup wizard: keepalive=$useKeep overlay=$useOverlay diag=$useDiag · " +
+            "names=" + (if (AppState.litoMode) "Lito" else "g_config.*") + (if (profileManual) " (manual)" else ""))
 
         // SKIP_AUTOSTART: we just applied exactly what the user chose, including
         // "autostart on but not now" — letting MainActivity re-run applyAutoStart
@@ -496,6 +677,11 @@ class SetupWizardActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- plumbing
+
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.cancel()          // the finish-time probe runs on its own scope and survives
+    }
 
     private fun toast(s: String) = android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_LONG).show()
 

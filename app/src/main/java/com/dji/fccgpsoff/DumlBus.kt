@@ -59,11 +59,19 @@ object DumlBus {
     fun sendMany(port: Int, frames: List<ByteArray>, gapMs: Int, tags: List<String>): Int {
         if (frames.isEmpty()) return 0
         for ((i, w) in frames.withIndex()) DiagLog.tx(port, tags.getOrElse(i) { "" }, w)
-        val n = DumlNative.nativeSendMany(port, frames.toTypedArray(), gapMs)
+        val r = DumlNative.nativeSendMany(port, frames.toTypedArray(), gapMs)
+        val n = r?.getOrNull(0) ?: -1
+        val reconnects = r?.getOrNull(1) ?: 0
         when {
             n < 0 -> DiagLog.warn("sendMany: no connect on $port — ${frames.size} frames not sent")
             n < frames.size -> DiagLog.warn("sendMany: only $n/${frames.size} frames written on $port")
         }
+        // A batch split across sockets is worth knowing about even when every frame
+        // went out: the profile opens a service-mode session (10:58 enter … exit), so
+        // a reconnect in the middle may leave the aircraft ignoring the rest. Until
+        // that is measured, this is the line that tells us which kind of send it was.
+        if (reconnects > 0)
+            DiagLog.warn("sendMany: $n frames on $port took $reconnects reconnect(s) — batch was SPLIT across sockets")
         return n
     }
 

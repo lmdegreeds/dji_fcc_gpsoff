@@ -106,14 +106,24 @@ object ForegroundGate {
     fun flySettling(ms: Long): Boolean = isFlyForeground && foregroundAgeMs < ms
 
     /**
-     * True when it is safe to run read-family features. Reads are risky ONLY
-     * while DJI Fly/Pilot is the active window; unknown foreground (service off)
-     * defaults to allowed to preserve prior behavior.
+     * True when it is safe to run read-family features.
+     *
+     * Unknown foreground now means NO. It used to mean yes, "to preserve prior
+     * behaviour" — but the unknown state is not rare and not harmless: Android
+     * disables an accessibility service on every reinstall, so the very first run of
+     * a fresh build has no window events at all, and every read-family feature would
+     * fire onto 40007 with DJI Fly genuinely in front. That is the worst case, not the
+     * safe one. Refusing until a window event has been seen costs one tap to enable
+     * the service, which the UI already asks for.
      */
-    fun readsAllowed(): Boolean = !isFlyForeground && !expectingFly
+    fun readsAllowed(): Boolean = foregroundPackage.isNotEmpty() && !isFlyForeground && !expectingFly
 
     /** Human-readable reason a read was blocked, or null when reads are allowed. */
     fun blockReason(): String? = when {
+        foregroundPackage.isEmpty() ->
+            "the foreground app is unknown — enable the accessibility service " +
+                "(\"DJI_FCC_GPSOFF — model & foreground\"), otherwise a read could land " +
+                "on DJI Fly's port while Fly is on screen"
         isFlyForeground ->
             "DJI Fly/Pilot is the active window — reads are blocked (would risk a video/link blip). " +
                 "Switch to this app (Fly stays running in the background), then retry."

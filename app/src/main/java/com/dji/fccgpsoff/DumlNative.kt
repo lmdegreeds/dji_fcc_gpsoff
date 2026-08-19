@@ -64,7 +64,8 @@ object DumlNative {
      * every new connect, so a frame-per-socket profile knocks its own frames out
      * mid-flight (see `Transport::send_many`). Use this for any multi-frame write.
      */
-    external fun nativeSendMany(port: Int, frames: Array<ByteArray>, gapMs: Int): Int
+    /** Returns `[framesWritten, reconnects]`, or `[-1, 0]` if the connect failed. */
+    external fun nativeSendMany(port: Int, frames: Array<ByteArray>, gapMs: Int): IntArray?
 
     /** Send one wire frame straight onto the controller's DUSS message bus
      *  (abstract unix socket `/duss/mb/0x205`) — the firmware-bus diagnostic path,

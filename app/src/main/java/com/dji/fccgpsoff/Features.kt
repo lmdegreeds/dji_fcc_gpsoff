@@ -51,20 +51,30 @@ class Features(ctx: Context) {
     }
 
     /**
-     * Switch radio CE→FCC by running FreeFCC's confirmed-working fcc.json
-     * sequence (sender 130, port 40009, 2 rounds) — the register writes
-     * (09:27 setForceFcc) + region are the device-independent core. Then a
-     * name-addressed regulatory write in the *profile's* spelling — on Lito X1
-     * that is ce_regulatory_level, which FreeFCC's fixed c1_* hash misses.
+     * Switch radio CE→FCC with ONE write: `07:30` to receiver 9, payload
+     * `41550000415500000100` (fcc.json) — where `4155` is the ASCII country and
+     * comes from [AppState.fccRegion] (AU unless the user picked another).
      *
-     * Persistent: the change only takes effect after a controller + aircraft
-     * reboot.
+     * It used to be FreeFCC's 21-frame sequence played twice, followed by a
+     * name-addressed `ce_regulatory_level` write. Frame-subset experiments on
+     * 2026-08-19 (RC 2 + Lito X1, doc/fcc-minimal-sequence.md) cut all of that:
+     * this one frame raises transmit power AND enables 5.8 GHz, and the
+     * regulatory write never stuck — it reads back `ff` whether FCC is on or off.
+     *
+     * The frame is sent EIGHT times, one second apart (fcc.json `rounds`, one
+     * connection per round). A single send is not enough on a live session: it
+     * failed over 20 s of watching, twice, while a one-second burst landed on the
+     * 3rd and 4th shot. Two sends 100 ms apart in one connection also failed, so
+     * what the aircraft wants is separate sends spaced in time.
+     *
+     * Persistent within a flight session: the change survives until the aircraft
+     * is power-cycled for real. A short "reboot" that does not fully cut power
+     * leaves it in place, which is why a CE reading is the only proof the switch
+     * was lost.
      */
     suspend fun applyFcc(): Boolean {
-        DiagLog.info("applyFcc: running fcc.json (FreeFCC sequence)")
-        // Hold ONE lease across the profile AND the follow-up regulatory write, so
-        // the whole Apply FCC is atomic against another of our sessions on 40009
-        // (previously the profile released the lock before the regulatory write).
+        val region = AppState.fccRegion
+        DiagLog.info("applyFcc: one frame 07:30 (fcc.json) · region " + region.display())
         // Short timeout on purpose: the lock's 3 s default let a second apply QUEUE
         // behind the first and run back to back. Measured on hardware — a keepalive
         // apply, an overlay tap and a session-edge apply once stacked into three
@@ -74,13 +84,11 @@ class Features(ctx: Context) {
             DiagLog.warn("applyFcc: another apply is already running — skipped"); return false
         }
         return try {
-            val res = runner.run(runner.load("fcc.json"), alreadyLeased = true)
-            val reg = ParameterAddress.REGULATORY.write(byteArrayOf(1), port = DumlWire.PORT_FCC, wrapped = false)
-            // Honest result: the profile frames AND the regulatory write all had to
-            // leave the socket. A partial send (link dropped mid-sequence) is a failed
-            // apply — do not report "FCC applied" for it. Cf. FreeFCC 099081c.
-            val ok = res.sent && reg
-            if (!ok) DiagLog.warn("applyFcc: incomplete send (frames=${res.sent}, regulatory=$reg) — not applied")
+            // Honest result: the frame had to leave the socket. A write that never
+            // went out is a failed apply — do not report "FCC applied" for it.
+            // Cf. FreeFCC 099081c.
+            val ok = runner.run(FccRegion.patch(runner.load("fcc.json"), region), alreadyLeased = true).sent
+            if (!ok) DiagLog.warn("applyFcc: frame did not leave the socket — not applied")
             ok
         } finally { lastApplyFinishedMs = System.currentTimeMillis(); lease.close() }
     }

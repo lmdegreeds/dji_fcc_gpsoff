@@ -122,25 +122,41 @@ class OverlayService : Service() {
         // Quick toggles only (LED / GPS) — wired to THIS app's Features.
         col.addTwo(t("💡 LED ВКЛ", "💡 LED ON"), { f.setLed(true) }, t("LED ВЫКЛ", "LED OFF"), { f.setLed(false) })
         col.addTwo(t("📍 GPS ВКЛ", "📍 GPS ON"), { f.setGps(true) }, t("GPS ВЫКЛ", "GPS OFF"), { f.setGps(false) })
+        // Whatever the user pinned in the parameter editor, below the built-in three.
+        val pins = OverlayParams.list(applicationContext)
+        for (pin in pins) col.addPin(pin)
 
         val foot = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(6), 0, 0) }
-        foot.addView(footBtn(t("Скрыть", "Hide"), 0xFF2E9BFF.toInt()) { togglePanel() }, equal())
-        foot.addView(footBtn(t("Открыть приложение", "Open app"), 0xFF2E9BFF.toInt()) {
+        foot.addView(footBtn(t("Скрыть", "Hide"), 0xFF2E9BFF.toInt()) { togglePanel() }, equal(1f))
+        // "Открыть приложение" did not fit its equal third and rendered as
+        // "Открыть прилож." — the button that leaves the overlay was the one nobody
+        // could read. It now gets half again the width of its neighbours and drops the
+        // verb: the arrow already says "go".
+        foot.addView(footBtn(t("▶ Приложение", "▶ Open app"), 0xFF2E9BFF.toInt()) {
             togglePanel()
             runCatching {
                 startActivity(Intent(this, MainActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_REORDER_TO_FRONT))
             }
-        }, equal())
-        foot.addView(footBtn(t("Выход", "Exit"), 0xFFFF453A.toInt()) { togglePanel(); stopSelf() }, equal())
+        }, equal(1.6f))
+        // Exit is the user turning the floating menu OFF, so it clears the auto-start
+        // flag too. The app now has ONE switch per service meaning "I want this on", and
+        // stopping the service while leaving it armed would make that switch show a state
+        // the service is not in.
+        foot.addView(footBtn(t("Выход", "Exit"), 0xFFFF453A.toInt()) {
+            togglePanel(); AppState.setAutoOverlay(applicationContext, false); stopSelf()
+        }, equal(1f))
         col.addView(foot, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
         // Appear right at the handle; open upward if the handle sits in the lower
         // half of the screen (default is bottom-center), else downward.
         val hp = handleParams
         val dm = resources.displayMetrics
-        val panelW = dp(300)
-        val panelH = dp(238)                 // FCC row + 2 toggle rows + footer, approx
+        val panelW = dp(320)
+        // FCC row + 2 toggle rows + footer, plus one row per pinned parameter. Only
+        // used to decide whether the panel opens upward or downward, so an approximation
+        // is enough — the window itself is WRAP_CONTENT.
+        val panelH = dp(238 + 52 * pins.size)
         val hx = hp?.x ?: 0
         val hy = hp?.y ?: dp(110)
         val px = hx.coerceIn(0, (dm.widthPixels - panelW).coerceAtLeast(0))
@@ -168,7 +184,62 @@ class OverlayService : Service() {
         addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
     }
 
-    private fun equal() = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    /**
+     * One pinned parameter: its short name, then a button per value worth writing.
+     *
+     * The buttons come from the parameter's OWN limits, not from a text field — this
+     * window is FLAG_NOT_FOCUSABLE (it must not steal DJI Fly's input), so it cannot
+     * take typed input at all. A 0/1 parameter therefore gets ON/OFF; anything else
+     * gets min / default / max, which is the set of values a catalog can vouch for.
+     *
+     * Nothing is read first. The overlay is used with Fly in front, which is exactly
+     * when reads are blocked, so the write is encoded from the type and limits the pin
+     * carried over from the editor. If that leaves the byte width unknown, the write is
+     * refused with the reason rather than guessed at — a wrong-width write to the
+     * flight controller is not a thing to guess.
+     */
+    private fun LinearLayout.addPin(pin: OverlayParams.Pin) {
+        val row = LinearLayout(this@OverlayService).apply {
+            orientation = LinearLayout.HORIZONTAL; setPadding(0, dp(4), 0, dp(4))
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        row.addView(TextView(this@OverlayService).apply {
+            text = pin.short(); setTextColor(0xF0FFFFFF.toInt()); textSize = 12f
+            setSingleLine(true); ellipsize = android.text.TextUtils.TruncateAt.START
+            setPadding(dp(2), 0, dp(4), 0)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.5f))
+        val choices: List<Pair<String, String>> =
+            if (pin.binary) listOf(t("ВКЛ", "ON") to "1", t("ВЫКЛ", "OFF") to "0")
+            else listOfNotNull(
+                pin.min.takeIf { it.isNotEmpty() }?.let { t("мин", "min") to it },
+                pin.def.takeIf { it.isNotEmpty() }?.let { t("станд.", "def") to it },
+                pin.max.takeIf { it.isNotEmpty() }?.let { t("макс", "max") to it })
+        if (choices.isEmpty()) {
+            row.addView(TextView(this@OverlayService).apply {
+                text = t("нет пределов — правьте в редакторе", "no limits — use the editor")
+                setTextColor(0xC0FFFFFF.toInt()); textSize = 10.5f
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 3f))
+        } else for ((label, value) in choices) {
+            row.addView(pillBtn("$label $value", 0x99484848.toInt()) { writePin(pin, value) },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(4) })
+        }
+        addView(row, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    }
+
+    /** Encode [value] for [pin] from its declared type/limits and write it by hash.
+     *  Returns false for anything that could not be encoded honestly, which pillBtn
+     *  already renders as a warning rather than a tick. */
+    private suspend fun writePin(pin: OverlayParams.Pin, value: String): Boolean =
+        when (val enc = ParamCatalog.encodeChecked(pin.def(), value, null)) {
+            is ParamCatalog.Encoded.Invalid -> {
+                DiagLog.warn("overlay ${pin.name} = $value refused: ${enc.reason}")
+                main.post { Toast.makeText(this, "⚠ ${pin.short()}: ${enc.reason}", Toast.LENGTH_LONG).show() }
+                false
+            }
+            is ParamCatalog.Encoded.Ok -> ParameterAddress(pin.name).write(enc.bytes, writes = 2, gapMs = 120)
+        }
+
+    private fun equal(weight: Float = 1f) = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, weight)
 
     private fun pillBtn(text: String, fill: Int, action: suspend () -> Any?): Button {
         val b = Button(this).apply {

@@ -67,6 +67,7 @@ class FccKeepaliveService : Service() {
         loop?.cancel()
         activeMode = mode
         DiagLog.info("keepalive: mode = ${mode.label}")
+        warnIfBlind()
         loop = scope.launch {
             if (awaitProxy() <= 0) return@launch              // cancelled while waiting
             // Feed DroneLink from 40007 while Fly isn't foreground. Started on the
@@ -79,6 +80,31 @@ class FccKeepaliveService : Service() {
             maintain(features)                                // verify region on 40009 + re-apply on drift/relink
         }
         return START_STICKY
+    }
+
+    /**
+     * Say it loudly when auto-FCC is about to run without eyes.
+     *
+     * Android disables an accessibility service on every reinstall, and nothing used
+     * to mention it. The keepalive then keeps applying on its bare timers: it cannot
+     * see the aircraft appear, so it fires whenever, not when the aircraft is ready.
+     * That cost nine consecutive test applies before anyone thought to check the one
+     * status field that showed it — a field nobody reads while the app looks healthy.
+     */
+    private fun warnIfBlind() {
+        val on = runCatching {
+            val expected = android.content.ComponentName(this, DjiFlyAccessibilityService::class.java)
+            android.provider.Settings.Secure.getString(
+                contentResolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+            ).orEmpty().split(':')
+                .mapNotNull(android.content.ComponentName::unflattenFromString)
+                .any { it == expected }
+        }.getOrDefault(false)
+        if (!on) DiagLog.warn(
+            "keepalive: ACCESSIBILITY SERVICE IS OFF — the aircraft-link detector is dead, so FCC " +
+            "is applied on bare timers instead of when the drone appears. Android switches this off " +
+            "on every reinstall. Enable it in Android settings → Accessibility."
+        )
     }
 
     /**
@@ -328,7 +354,24 @@ class FccKeepaliveService : Service() {
         var sessionStartedMs = System.currentTimeMillis()
         var idleLogged = false
         var nextVerifyMs = System.currentTimeMillis() + VERIFY_INTERVAL_MS
+        var flyWasForeground = ForegroundGate.isFlyForeground
         while (isActive) {
+            // DJI Fly coming back to the front is the moment FCC is most likely to have
+            // just been lost: measured 2026-08-19, a Fly restart drops it, and so does a
+            // trip through our own screen. Merely minimising Fly does NOT — but this edge
+            // covers that case too, at the cost of one burst.
+            //
+            // It does not apply here; it makes the blind apply DUE. Everything below —
+            // the settle deferral that keeps us off the radio while Fly's link comes up,
+            // the port lease, the logging — then applies unchanged. Forcing the apply
+            // from this point instead would have to duplicate all of it.
+            val flyNow = ForegroundGate.isFlyForeground
+            if (flyNow && !flyWasForeground) {
+                DiagLog.info("keepalive: DJI Fly is back in front — FCC re-apply queued " +
+                             "(waits for its link to settle)")
+                lastApplyMs = 0L
+            }
+            flyWasForeground = flyNow
             // Tick fine, verify slow. The loop used to sleep the whole verify interval,
             // so a new aircraft session waited up to VERIFY_INTERVAL_MS to be noticed —
             // measured on hardware: the screen saw the aircraft at 08:49:19.1 and the

@@ -25,7 +25,8 @@ import kotlinx.coroutines.runBlocking
  *   GET  /stats               native transport counters
  *   GET  /ports               loopback DUML port scan
  *   GET  /connect             start the persistent main channel
- *   GET  /fcc                 apply FCC (runs fcc.json + the regulatory write)
+ *   GET  /fcc                 apply FCC (one frame 07:30 — fcc.json, country = /region)
+ *   GET  /region[?set=XX]     read / set the radio country every FCC command writes
  *   GET  /keepon?mode=        start the keepalive (mode=home_point|periodic)
  *   GET  /keepoff             stop the keepalive
  *   GET  /homepoint           passive 03:44 home-point state (the event trigger)
@@ -445,6 +446,7 @@ object DiagServer {
             "\"keepaliveRunning\":${FccKeepaliveService.running}," +
             "\"keepaliveActiveMode\":\"${FccKeepaliveService.activeMode?.wire ?: ""}\"," +
             "\"overlayRunning\":${OverlayService.running},\"diagRunning\":$isRunning," +
+            "\"fccRegion\":\"${AppState.fccRegion.code}\",\"fccRegionLabel\":${Json.quote(AppState.fccRegion.label)}," +
             "\"a11y\":${ForegroundGate.accessibilityConnected}}"
 
     /**
@@ -654,6 +656,55 @@ object DiagServer {
                 "/connect" -> "port=" + f.connect()
                 "/disconnect" -> { f.disconnect(); "main channel released (up only while capture or /connect holds it)" }
                 "/fcc" -> if (f.applyFcc()) "FCC sent — reboot to apply" else "port busy"
+                // Minimal-sequence search: play a SUBSET of fcc_full.json and score the
+                // two visible effects by eye. See Experiment.kt for why the verdict
+                // is persisted and why a single negative run proves nothing.
+                "/frames" -> Experiment.frames(appCtx, query(path, "profile"))
+                "/exp" -> runCatching {
+                    val profile = query(path, "profile")
+                    val keep = Experiment.select(appCtx, query(path, "keep"), query(path, "drop"), profile)
+                    Experiment.start(
+                        appCtx,
+                        label = query(path, "label") ?: "exp",
+                        keep = keep,
+                        count = query(path, "count")?.toIntOrNull() ?: 5,
+                        gapSec = query(path, "gap")?.toIntOrNull() ?: 15,
+                        rounds = query(path, "rounds")?.toIntOrNull() ?: 2,
+                        // Apply FCC no longer sends the regulatory write (it never stuck), so the
+                        // harness default matches the product: off unless explicitly asked for.
+                        withReg = (query(path, "reg")?.toIntOrNull() ?: 0) != 0,
+                        profile = profile,
+                    )
+                }.getOrElse { "bad subset: ${it.message}" }
+                "/exp/status" -> Experiment.status()
+                "/exp/cancel" -> Experiment.cancel()
+                "/exp/verdict" -> Experiment.verdict(
+                    appCtx,
+                    power = (query(path, "power")?.toIntOrNull() ?: 0) != 0,
+                    r58 = (query(path, "r58")?.toIntOrNull() ?: 0) != 0,
+                    note = query(path, "note"),
+                )
+                "/exp/log" -> Experiment.log(appCtx)
+                // Opens Android's "App info" page for DJI Fly, where Force stop and Open
+                // are one tap each. A persistence run needs Fly restarted between the
+                // apply and the reading, and hunting that screen down by hand every round
+                // is most of the round. No accessibility involved — a plain settings
+                // intent; we only launch it, the taps stay the operator's.
+                "/flyinfo" -> {
+                    val pkg = query(path, "pkg")
+                        ?: ForegroundGate.DJI_PACKAGES.firstOrNull { p ->
+                            runCatching { appCtx.packageManager.getPackageInfo(p, 0) }.isSuccess
+                        }
+                    if (pkg == null) "no DJI package installed"
+                    else runCatching {
+                        appCtx.startActivity(
+                            android.content.Intent(
+                                android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                                android.net.Uri.parse("package:$pkg"),
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK))
+                        "opened App info for $pkg — tap Force stop, then Open"
+                    }.getOrElse { "could not open App info: ${it.message}" }
+                }
                 // Experiment harness: fire EXACTLY ONE apply, `sec` seconds after the
                 // next aircraft session appears on DJI Fly's screen, and nothing else.
                 //
@@ -664,17 +715,29 @@ object DiagServer {
                 "/applyat" -> {
                     if (query(path, "cancel") == "1") { ApplyAt.cancel(); "armed apply cancelled" }
                     else ApplyAt.arm(appCtx, scope, query(path, "sec")?.toLongOrNull() ?: 10L,
-                        query(path, "then")?.toLongOrNull() ?: 0L)
+                        query(path, "then")?.toLongOrNull() ?: 15L,
+                        query(path, "count")?.toIntOrNull() ?: 1)
                 }
                 "/applyat/status" -> ApplyAt.status()
                 "/ce" -> "disabled: Restore CE was removed from this build (FCC-only)"
                 "/keepon" -> {
                     val mode = KeepaliveMode.of(query(path, "mode") ?: AppState.keepaliveMode.wire)
                     AppState.setKeepaliveMode(appCtx, mode)
+                    AppState.setAutoKeepalive(appCtx, true)
                     FccKeepaliveService.start(appCtx, mode)
                     "keepalive started — ${mode.label}"
                 }
-                "/keepoff" -> { FccKeepaliveService.stop(appCtx); "keepalive stopped" }
+                // Clears the auto-start flag too, otherwise this is a pause, not an off:
+                // MainActivity.applyAutoStart() re-launches the keepalive whenever its
+                // screen is opened, so a /keepoff issued for a measurement was silently
+                // undone the next time the user switched to the app — and the "manual
+                // only" runs it was meant to isolate were quietly full of automatic
+                // applies. Symmetric with /keepon, which arms it again.
+                "/keepoff" -> {
+                    AppState.setAutoKeepalive(appCtx, false)
+                    FccKeepaliveService.stop(appCtx)
+                    "keepalive stopped (auto-start disabled too — /keepon re-arms it)"
+                }
                 "/overlayon" -> { OverlayService.start(appCtx); "overlay requested (needs 'display over other apps')" }
                 "/overlayoff" -> { OverlayService.stop(appCtx); "overlay stopped" }
                 "/profile" -> {
@@ -700,11 +763,44 @@ object DiagServer {
                         " (variant=${StartupProbe.variant}" +
                         (if (StartupProbe.variant == null) ", undecided — profile left as it was" else "") + ")"
                 }
+                // One switch per service, same as the app: setting a flag also RUNS or
+                // STOPS the service. Since 2026-08-19 the two are one control everywhere,
+                // and a dashboard that only armed the flag could put the app's switch out
+                // of step with what is actually running.
                 "/setauto" -> {
-                    query(path, "ka")?.let { AppState.setAutoKeepalive(appCtx, it == "1") }
-                    query(path, "ov")?.let { AppState.setAutoOverlay(appCtx, it == "1") }
-                    query(path, "diag")?.let { AppState.setAutoDiag(appCtx, it == "1") }
-                    "auto-start: keepalive=${AppState.autoKeepalive} overlay=${AppState.autoOverlay} diag=${AppState.autoDiag}"
+                    query(path, "ka")?.let {
+                        val on = it == "1"
+                        AppState.setAutoKeepalive(appCtx, on)
+                        if (on) FccKeepaliveService.start(appCtx) else FccKeepaliveService.stop(appCtx)
+                    }
+                    query(path, "ov")?.let {
+                        val on = it == "1"
+                        AppState.setAutoOverlay(appCtx, on)
+                        if (on) OverlayService.start(appCtx) else OverlayService.stop(appCtx)
+                    }
+                    query(path, "diag")?.let {
+                        val on = it == "1"
+                        AppState.setAutoDiag(appCtx, on)
+                        // Not stopping ourselves here: this very request is being served by
+                        // the diag server, and tearing it down mid-response would drop the
+                        // reply the dashboard is waiting for. DiagService.stop is the app's
+                        // job; the flag is what a browser can honestly change.
+                        if (on) DiagService.start(appCtx)
+                    }
+                    "services: keepalive=${AppState.autoKeepalive} overlay=${AppState.autoOverlay} diag=${AppState.autoDiag}"
+                }
+                // The radio country every FCC command writes. Read with no argument;
+                // ?set=XX picks one of FccRegion's codes (an unknown code is refused
+                // rather than written — the radio would silently ignore it).
+                "/region" -> {
+                    val want = query(path, "set")
+                    if (want == null) "region: ${AppState.fccRegion.display()} · known: " +
+                        FccRegion.values().joinToString(" ") { it.code }
+                    else {
+                        val r = FccRegion.values().firstOrNull { it.code.equals(want.trim(), true) }
+                        if (r == null) "unknown region '$want' — known: " + FccRegion.values().joinToString(" ") { it.code }
+                        else { AppState.setFccRegion(appCtx, r); "region set to ${r.display()}" }
+                    }
                 }
                 "/appstate" -> appStateJson()
                 "/state" -> { FlightState.refresh(); FlightState.statusJson() }
@@ -844,10 +940,11 @@ object DiagServer {
                     val ms = (query(path, "ms")?.toIntOrNull() ?: 1000).coerceIn(0, MAX_WINDOW_MS)
                     probe(port, DumlWire.hex(hex), ms)
                 }
-                "/help" -> "endpoints: /version /log /logjson /stats /applyat?sec=&then=&cancel=1 /applyat/status /ports /connect /disconnect /fcc " +
+                "/help" -> "endpoints: /version /log /logjson /stats /applyat?sec=&then=&count=&cancel=1 /applyat/status /ports /connect /disconnect /fcc " +
+                        "/frames /exp?keep=|drop=&label=&count=&gap=&rounds=&reg= /exp/status /exp/cancel /exp/verdict?power=&r58=&note= /exp/log " +
                         "/foreground /identity /identity/forget /model /rc /screen /a11y " +
                         "/keepon?mode=home_point|periodic /keepoff /overlayon /overlayoff " +
-                        "/profile?lito=1|0 /setauto?ka=&ov=&diag= /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +
+                        "/profile?lito=1|0 /setauto?ka=&ov=&diag= /region[?set=AU] /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +
                         "/ledon /ledoff /gpson /gpsoff /deviceinfo /serial[?live=1] /readparams /clear " +
                         "/params.json?q=&limit=&edit=1&group= /params/read[.json]?name= /params/write?name=&value= " +
                         "/params/info[.json]?name= /params/reset?name=[&fallback=1] /profile/detect " +

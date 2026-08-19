@@ -4,18 +4,21 @@ package com.dji.fccgpsoff
  * Read-only radio-country probe (07:19) — the cheap "is FCC still on?" question
  * that makes a keepalive loop nearly free (ported from Skylab's FccCountryRegion).
  *
- * fcc.json writes the country as ASCII "AU" (the 41 55 inside the 07:30 channel
- * groups and the 07:18 channel map), so a controller that still answers "AU" has
+ * fcc.json writes the country as two ASCII letters (the 41 55 = "AU" inside the
+ * 07:30 channel groups), so a controller that still answers the code we wrote has
  * not been pushed back to CE and needs no re-write. One short frame per tick
  * instead of replaying 21 frames x 2 rounds.
  *
- * A null is "no answer", NOT "not AU": injected reads do not always route back
+ * Which code that is is the user's choice since 2026-08-19 — see [FccRegion] —
+ * so the expected answer is [target], not a constant.
+ *
+ * A null is "no answer", NOT "not [target]": injected reads do not always route back
  * on RC2 (see [ParameterAddress.read]), so callers must treat the two apart.
  */
 object FccCountry {
 
-    /** What fcc.json writes. */
-    const val TARGET = "AU"
+    /** What the FCC apply currently writes — the selected [FccRegion]'s code. */
+    val target: String get() = AppState.fccRegion.code
 
     private const val SENDER = 0x2A     // Skylab's country-query sender index
     private const val DST = 0x09        // SDR / radio

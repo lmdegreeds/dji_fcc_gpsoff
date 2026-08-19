@@ -78,9 +78,23 @@ object FlyLinkUi {
  */
 object FlyLink {
 
-    /** How long DJI Fly must keep saying "no aircraft" before the next CONNECTED
-     *  counts as a new flight session rather than a flicker. */
-    const val STABLE_DISCONNECT_MS = 10_000L
+    /**
+     * How long DJI Fly must keep saying "no aircraft" before the next CONNECTED
+     * counts as a new flight session rather than one of Fly's own blips.
+     *
+     * Measured, not guessed. Across a day of logs the two populations do not overlap
+     * anywhere near each other:
+     *
+     *     genuine Fly flickers : 0.15 s, 0.9 s
+     *     real power cycles    : 8.4, 8.5, 9.1, 9.4, 9.5 s and up
+     *
+     * The band between 1 s and 8 s is empty. The original 10 s sat ABOVE every real
+     * power cycle, so it filtered out exactly what it was supposed to catch: two
+     * measurement runs fired nothing at all because a 9 s power-cycle was written off
+     * as a blip, and in normal use a quick battery swap would never re-apply FCC.
+     * 3 s is 3x the longest flicker seen and well under the shortest real cycle.
+     */
+    const val STABLE_DISCONNECT_MS = 3_000L
 
     /** A verdict this recent is simply the truth, whatever else is going on. */
     const val STALE_MS = 30_000L

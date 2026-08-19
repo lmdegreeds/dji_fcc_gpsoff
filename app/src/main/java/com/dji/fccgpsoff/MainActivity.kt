@@ -42,9 +42,15 @@ import kotlinx.coroutines.launch
 /**
  * Compact single-screen shell for the RC2 landscape display. No system title bar
  * and no page-nav strip — a single thin top row carries the device summary and a
- * ⋮ menu that hides Log / Services / About. The main page shows the
- * FCC switch and the live LED / GPS / flight-mode state (read back by hash while
- * our window is in front).
+ * ⋮ menu holding the other pages.
+ *
+ * The pages are split by WHEN they are used, not by what they configure
+ * (2026-08-19). Main is the flight screen: Apply FCC, the live LED / GPS /
+ * flight-mode state, and the two service switches that matter in the air.
+ * Diagnostics carries the log and the web dashboard that serves it. Settings
+ * carries what is set once — device profile, FCC region, updates, language. The
+ * old Services page is gone: each service is now ONE switch that both runs it and
+ * arms its auto-start, sitting on the page where that service is used.
  */
 class MainActivity : Activity() {
 
@@ -73,16 +79,12 @@ class MainActivity : Activity() {
     private lateinit var modeVal: TextView
     private lateinit var stateNote: TextView
     private lateinit var deviceView: TextView
-    private lateinit var linkDot: TextView
 
     private var pages = HashMap<String, View>()
     private var current = "main"
     private var foreground = false
     private var loopJob: Job? = null
     @Volatile private var flyStat = "?"
-    /** Set on foreground entry / aircraft change to force one immediate live-state
-     *  read; between those the loop throttles 40007 reads (see [READ_INTERVAL_MS]). */
-    @Volatile private var refreshNow = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -104,10 +106,10 @@ class MainActivity : Activity() {
         // is an app that simply "crashes", with nothing to go on. Now the broken
         // page shows its own exception and every other page still works.
         pages["main"] = page("main") { buildMain() }
-        pages["services"] = page("services") { buildServices() }
         pages["params"] = page("params") { buildParams() }
+        pages["diag"] = page("diag") { buildDiag() }
+        pages["settings"] = page("settings") { buildSettings() }
         pages["about"] = page("about") { buildAbout() }
-        pages["log"] = page("log") { buildLog() }
         for ((k, v) in pages) content.addView(v.apply { visibility = if (k == "main") View.VISIBLE else View.GONE },
             FrameLayout.LayoutParams(MATCH_PARENT, MATCH_PARENT))
         root.addView(content, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
@@ -120,7 +122,7 @@ class MainActivity : Activity() {
         // line saturated the UI thread and froze the Log page — so schedule at most one
         // render per LOG_RENDER_THROTTLE_MS instead of one per line.
         DiagLog.listener = { _ ->
-            if (current == "log" && logRenderPending.compareAndSet(false, true))
+            if (current == "diag" && logRenderPending.compareAndSet(false, true))
                 logView.postDelayed({ logRenderPending.set(false); renderLog() }, LOG_RENDER_THROTTLE_MS)
         }
         maybeRequestNotifications()
@@ -204,10 +206,12 @@ class MainActivity : Activity() {
             text = "⚡ DJI_FCC_GPSOFF"
         }
         bar.addView(summary, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        linkDot = TextView(this).apply {
-            textSize = 11.5f; typeface = Typeface.DEFAULT_BOLD; setPadding(dp(8), dp(4), dp(8), dp(4)); text = t("дрон ○", "drone ○"); setTextColor(MUTED)
-        }
-        bar.addView(linkDot)
+        // No live "drone ●/○" pill here any more (2026-08-19). The only signal that
+        // could keep it honest was a flight-controller read, and reads no longer run on
+        // a timer — they cost DJI Fly frames on 40007. A dot that is right only just
+        // after the user pressed "Read state", and stale-but-confident the rest of the
+        // time, is worse than no dot: what an explicit read established is reported
+        // where it was asked for, under the LED / GPS / mode switches.
         // Wider than the glyph needs: this is the only way to reach every other page, and
         // it lives in the corner of a screen people poke at while holding a controller.
         val menu = TextView(this).apply {
@@ -234,11 +238,10 @@ class MainActivity : Activity() {
         // not be able to miss its branch.
         val items = listOf(
             t("Главная", "Main") to "main",
-            t("Параметры", "Params") to "params",
-            t("Лог", "Log") to "log",
-            t("Сервисы", "Services") to "services",
+            t("Редактор параметров", "Parameter editor") to "params",
+            t("Диагностика", "Diagnostics") to "diag",
+            t("Настройки", "Settings") to "settings",
             t("Мастер настройки", "Setup wizard") to "wizard",
-            t("Язык: English", "Language: Русский") to "lang",
             t("О программе", "About") to "about")
         val col = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -258,7 +261,6 @@ class MainActivity : Activity() {
                     pop.dismiss()
                     when (key) {
                         "wizard" -> startActivity(Intent(this@MainActivity, SetupWizardActivity::class.java))
-                        "lang" -> toggleLanguage()
                         else -> showPage(key)
                     }
                 }
@@ -277,11 +279,11 @@ class MainActivity : Activity() {
     private fun showPage(key: String) {
         for ((k, v) in pages) v.visibility = if (k == key) View.VISIBLE else View.GONE
         current = key
-        if (key == "log") renderLog()
+        if (key == "diag") renderLog()
     }
 
     // ---- swipe left / right to page, without blocking scroll or taps ----
-    private val pageOrder = listOf("main", "params", "log", "services", "about")
+    private val pageOrder = listOf("main", "params", "diag", "settings", "about")
     private val gesture by lazy {
         GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
             override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
@@ -399,12 +401,7 @@ class MainActivity : Activity() {
         stateBody.addView(stateNote)
         // State is read on demand only (opening the app, an aircraft change, a write,
         // or this button) — never on a timer — so 40007 is not churned. Cf. flyStatus.
-        stateBody.addView(rowc(smallBtn(t("↻ Прочитать состояние", "↻ Read state"), SLATE) {
-            refreshNow = true
-            setStatus(if (ForegroundGate.readsAllowed()) t("↻ перечитываю состояние…", "↻ re-reading state…")
-                      else t("⚠ DJI Fly на переднем плане — переключитесь в это приложение, чтобы прочитать состояние",
-                             "⚠ DJI Fly is active — switch to this app to read state"))
-        }), tightLp())
+        stateBody.addView(rowc(smallBtn(t("↻ Прочитать состояние", "↻ Read state"), SLATE) { readStateNow() }), tightLp())
         // Title-less, compact (no card header) to save vertical space.
         val stateCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -413,26 +410,24 @@ class MainActivity : Activity() {
             addView(stateBody)
         }
 
-        // Auto-start switches, duplicated from the Services page onto the main screen
-        // (free space under Read state). These set only the auto-start-on-launch flags;
-        // the services themselves are toggled on the Services page.
-        mainKaAuto = mkSwitch(AppState.autoKeepalive).apply { setOnClickListener { AppState.setAutoKeepalive(this@MainActivity, isChecked) } }
-        mainDiagAuto = mkSwitch(AppState.autoDiag).apply { setOnClickListener { AppState.setAutoDiag(this@MainActivity, isChecked) } }
-        mainOvAuto = mkSwitch(AppState.autoOverlay).apply { setOnClickListener { AppState.setAutoOverlay(this@MainActivity, isChecked) } }
-        // Title-less, compact auto-start block (no card header, tight padding) so the
-        // right column fits without a vertical scroll. Rows are spaced by the switches.
+        // The two services that belong on a flight screen. The web dashboard is not
+        // here on purpose — it is a diagnostics tool and lives on the Diagnostics page,
+        // beside the log it serves.
+        kaSw = masterSwitch(AppState.autoKeepalive) { on -> setKeepaliveService(on) }
+        ovSw = masterSwitch(AppState.autoOverlay) { on -> setOverlayService(on) }
+        // Title-less, compact block (no card header, tight padding) so the right column
+        // fits without a vertical scroll. Rows are spaced by the switches.
         val autoCard = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            background = pillBg(CARD, dp(16)); setPadding(dp(12), dp(2), dp(12), dp(2))
+            background = pillBg(CARD, dp(16)); setPadding(dp(12), dp(4), dp(12), dp(6))
             layoutParams = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(9) }
-            addView(cell(t("⚡ Авто-FCC", "⚡ Auto FCC"), mainKaAuto))
-            addView(cell(t("🌐 Веб-дашборд", "🌐 Web dashboard"), mainDiagAuto))
-            addView(cell(t("🎈 Плавающее меню", "🎈 Foreground menu"), mainOvAuto))
-            mainDiagUrl = TextView(this@MainActivity).apply {
-                setTextColor(GREEN); textSize = 11.5f; typeface = Typeface.MONOSPACE
-                setPadding(0, dp(5), 0, 0); visibility = View.GONE
-            }
-            addView(mainDiagUrl)
+            addView(cell(t("⚡ Авто-FCC", "⚡ Auto FCC"), kaSw))
+            addView(cell(t("🎈 Плавающее меню", "🎈 Floating menu"), ovSw))
+            addView(TextView(this@MainActivity).apply {
+                text = t("Переключатель запускает сервис и добавляет его в автозапуск",
+                         "One switch: runs the service and arms its auto-start")
+                setTextColor(MUTED); textSize = 10.5f; setPadding(0, dp(4), 0, 0)
+            })
         }
 
         fun column(vararg cards: View) = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; for (c in cards) addView(c) }
@@ -468,47 +463,136 @@ class MainActivity : Activity() {
         }
     }
 
-    // ---------- services page ----------
-    private lateinit var kaSw: Switch; private lateinit var diagSw: Switch; private lateinit var ovSw: Switch
+    // ---------- service switches (one control per service) ----------
+    /** Main-page service switches. Each is the ONE control for its service. */
+    private lateinit var kaSw: Switch
+    private lateinit var ovSw: Switch
     /** The big green Apply-FCC button, relabelled by [syncFccButtonLabel] when auto is on. */
     private lateinit var fccApplyBtn: Button
-    private lateinit var litoSw: Switch
-    // Main-screen copies of the service auto-start switches (also on the Services page).
-    private lateinit var mainKaAuto: Switch; private lateinit var mainDiagAuto: Switch; private lateinit var mainOvAuto: Switch
-    private lateinit var mainDiagUrl: TextView   // web-dashboard URL shown here while diag is running
+
+    /**
+     * A switch that both RUNS a service and ARMS its auto-start, in one tap.
+     *
+     * Until 2026-08-19 those were two switches on two pages — "run it now" on the
+     * Services page, "start it next time" on Main — and together they could express
+     * two states nobody ever wants: a service running that will not come back, and
+     * one armed but not running. The user only ever means "I want this on", so
+     * there is now one control that means exactly that.
+     *
+     * [onSet] returns false to REFUSE the change (the overlay does that when its
+     * "draw over other apps" grant is missing); the switch then snaps back, because
+     * nothing happened.
+     */
+    private fun masterSwitch(on: Boolean, onSet: (Boolean) -> Boolean) = mkSwitch(on).apply {
+        setOnClickListener {
+            val want = isChecked
+            if (!onSet(want)) isChecked = !want
+        }
+    }
+
+    private fun setKeepaliveService(on: Boolean): Boolean {
+        AppState.setAutoKeepalive(this, on)
+        if (on) FccKeepaliveService.start(this) else FccKeepaliveService.stop(this)
+        // The service's own flag lags start()/stop() by a moment, so label from the
+        // intent — otherwise the button keeps its old text until something else
+        // happens to refresh it.
+        setFccButtonLabel(on)
+        setStatus(if (on) t("⚡ авто-FCC включён · и поднимается при старте приложения",
+                            "⚡ auto FCC on · and starts with the app")
+                  else t("авто-FCC выключен · из автозапуска убран", "auto FCC off · removed from auto-start"))
+        return true
+    }
+
+    private fun setOverlayService(on: Boolean): Boolean {
+        if (on && !ensureOverlay()) return false      // no permission ⇒ nothing happened
+        AppState.setAutoOverlay(this, on)
+        if (on) OverlayService.start(this) else OverlayService.stop(this)
+        setStatus(if (on) t("🎈 плавающее меню включено · и поднимается при старте приложения",
+                            "🎈 floating menu on · and starts with the app")
+                  else t("плавающее меню выключено · из автозапуска убрано", "floating menu off · removed from auto-start"))
+        return true
+    }
+
+    private fun setDashboardService(on: Boolean): Boolean {
+        AppState.setAutoDiag(this, on)
+        if (on) DiagService.start(this) else DiagService.stop(this)
+        updateDiagUrl(on)
+        setStatus(if (on) t("🌐 веб-дашборд включён · и поднимается при старте приложения",
+                            "🌐 web dashboard on · and starts with the app")
+                  else t("веб-дашборд выключен · из автозапуска убран", "web dashboard off · removed from auto-start"))
+        return true
+    }
+
+    // ---------- diagnostics page (web dashboard + live log) ----------
+    private lateinit var diagSw: Switch
     private lateinit var diagUrl: TextView
-    private fun buildServices(): View {
-        kaSw = serviceSwitch { on ->
-            if (on) FccKeepaliveService.start(this) else FccKeepaliveService.stop(this)
-            // The service flag lags start()/stop() by a moment, so label from the
-            // intent, not from the flag — otherwise the button keeps the old text
-            // until something else happens to refresh it.
-            setFccButtonLabel(on)
-            setStatus(t("keepalive ", "keepalive ") + if (on) t("вкл", "on") else t("выкл", "off")) }
-        diagUrl = TextView(this).apply { setTextColor(GREEN); textSize = 12.5f; typeface = Typeface.MONOSPACE; setPadding(0, dp(7), 0, 0) }
-        diagSw = serviceSwitch { on -> if (on) { DiagService.start(this); updateDiagUrl(true); setStatus(t("дашборд включён", "diag on")) } else { DiagService.stop(this); updateDiagUrl(false); setStatus(t("дашборд выключен", "diag off")) } }
-        ovSw = serviceSwitch { on -> if (on) { if (!ensureOverlay()) { ovSw.isChecked = false; return@serviceSwitch }; OverlayService.start(this); setStatus(t("меню включено", "overlay on")) } else { OverlayService.stop(this); setStatus(t("меню выключено", "overlay off")) } }
-        val kaAuto = mkSwitch(AppState.autoKeepalive).apply { setOnClickListener { AppState.setAutoKeepalive(this@MainActivity, isChecked) } }
-        val diagAuto = mkSwitch(AppState.autoDiag).apply { setOnClickListener { AppState.setAutoDiag(this@MainActivity, isChecked) } }
-        val ovAuto = mkSwitch(AppState.autoOverlay).apply { setOnClickListener { AppState.setAutoOverlay(this@MainActivity, isChecked) } }
 
-        val svc = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        svc.addView(serviceItem(t("Авто-применение FCC при подключении", "Auto-apply FCC on connect"),
-            t("Отправляет полный пакет FCC в момент, когда дрон реально появился на линке (пошла телеметрия), а не просто когда открыт порт — и переприменяет при каждом релинке. По событиям, без трафика вхолостую. Включите автозапуск ниже, чтобы сервис поднимался при старте приложения и после перезагрузки пульта.",
-              "Sends the full FCC package the moment the aircraft comes on the link (telemetry starts) — not on a bare open port — then re-applies on each relink / new home point. Event-driven, no idle traffic. Turn on its auto-start below to arm it on launch and after a controller reboot."), kaSw))
-        svc.addView(serviceItem(t("Веб-диагностика (:8899)", "Web diagnostics (:8899)"),
-            t("Отдаёт дашборд и живой лог на http://<ip-пульта>:8899 для ПК в той же сети. Через него же скриншоты и захват трафика.",
-              "Serves a dashboard + live log at http://<RC-ip>:8899 for a PC on the same Wi-Fi. Also does the screenshot / capture."), diagSw), rowLp())
-        svc.addView(serviceItem(t("Плавающее меню поверх DJI Fly", "Floating controls over DJI Fly"),
-            t("Маленькая панель поверх всех окон с LED / GPS / FCC прямо во время полёта в DJI Fly. Нужно разрешение «поверх других приложений».",
-              "A small always-on-top panel with LED / GPS / FCC while you fly in DJI Fly. Needs the “display over other apps” permission."), ovSw), rowLp())
-        svc.addView(diagUrl)
-        svc.addView(TextView(this).apply { text = t("Запускать автоматически при старте приложения ↓", "Start automatically when the app launches ↓"); setTextColor(MUTED); textSize = 11f; setPadding(0, dp(12), 0, dp(2)) })
-        svc.addView(cell(t("Авто-применение FCC", "Auto-apply FCC on connect"), kaAuto), rowLp())
-        svc.addView(cell(t("Веб-диагностика", "Web diagnostics"), diagAuto), rowLp())
-        svc.addView(cell(t("Плавающее меню", "Floating controls"), ovAuto), rowLp())
-        val servicesCard = card(t("🛠 Фоновые сервисы", "🛠 Background services"), svc)
+    /**
+     * Everything you look at when something is wrong: the live log, and the web
+     * dashboard that serves that same log — plus parameters, flight records and the
+     * screen — to a browser on the same network. They belong together, the dashboard
+     * being a second window onto this very page, which is why its switch moved here
+     * off the main screen.
+     */
+    private fun buildDiag(): View {
+        diagSw = masterSwitch(AppState.autoDiag) { on -> setDashboardService(on) }
+        diagUrl = TextView(this).apply {
+            setTextColor(GREEN); textSize = 12f; typeface = Typeface.MONOSPACE; setPadding(0, dp(6), 0, 0)
+        }
+        val dash = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        dash.addView(cell(t("🌐 Веб-дашборд (:8899)", "🌐 Web dashboard (:8899)"), diagSw))
+        dash.addView(TextView(this).apply {
+            text = t("Отдаёт лог, параметры, логи полётов и экран пульта браузеру в той же сети. " +
+                     "Переключатель запускает сервис и добавляет его в автозапуск.",
+                     "Serves the log, parameters, flight records and the RC's screen to a browser on the same " +
+                     "network. The switch runs the service and arms its auto-start.")
+            setTextColor(MUTED); textSize = 10.5f; setLineSpacing(dp(2).toFloat(), 1f); setPadding(0, dp(3), 0, 0)
+        })
+        // The one thing a user must know before leaving it running — the same words
+        // the wizard and About use, from AppCopy, so the three cannot drift.
+        dash.addView(TextView(this).apply {
+            text = if (AppState.uiRu) AppCopy.DIAG_WARNING_RU else AppCopy.DIAG_WARNING_EN
+            setTextColor(AMBER); textSize = 10.5f; setLineSpacing(dp(2).toFloat(), 1f); setPadding(0, dp(5), 0, 0)
+        })
+        dash.addView(diagUrl)
 
+        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(8), dp(12), dp(8)) }
+        col.addView(card(dash))
+        col.addView(rowc(
+            smallBtn(t("Очистить", "Clear"), SLATE) { DiagLog.clear(); renderLog() },
+            smallBtn(t("Экспорт", "Export"), BLUE) { setStatus(t("сохранено: ", "saved: ") + DiagLog.export(applicationContext)); renderLog() },
+            smallBtn(t("Поделиться", "Share"), VIOLET) {
+                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
+                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, DiagLog.asText()) }, t("Отправить лог", "Share log")))
+            }))
+        // A real ScrollView (not TextView + ScrollingMovementMethod): the latter
+        // scrolls the text itself and paints a white text-selection highlight on the
+        // line under the finger while dragging, and every new log line reset the
+        // scroll. Here dragging is normal and highlight-free, and the tail is followed.
+        logView = TextView(this).apply {
+            setTextColor(INK); textSize = 10.5f; typeface = Typeface.MONOSPACE
+            setPadding(dp(10), dp(10), dp(10), dp(10))
+            setTextIsSelectable(false); highlightColor = Color.TRANSPARENT
+        }
+        logScroll = ScrollView(this).apply {
+            isFillViewport = true; background = pillBg(0xFF0C0E15.toInt(), dp(12)); addView(logView)
+        }
+        col.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f).apply { topMargin = dp(8) })
+        updateDiagUrl(DiagServer.isRunning)
+        return col
+    }
+
+    // ---------- settings page ----------
+    private lateinit var litoSw: Switch
+    private lateinit var regionBtn: Button
+
+    /**
+     * What is set once and then left alone: which parameter-name variant this
+     * aircraft uses, which radio country the FCC frames carry, updates, and the UI
+     * language. The services that used to share this page moved to where they are
+     * actually used — the flight switches to Main, the dashboard to Diagnostics.
+     */
+    private fun buildSettings(): View {
         litoSw = mkSwitch(AppState.litoMode).apply {
             setOnClickListener {
                 // Flipping this by hand is an override that must survive the next startup
@@ -525,6 +609,19 @@ class MainActivity : Activity() {
                                "📟 Device profile (auto-detected at start by param-name probe)"),
             cell(t("Имена Lito (выкл = имена g_config.*)", "Lito names (off = g_config.* names)"), litoSw))
 
+        regionBtn = smallBtn(AppState.fccRegion.display(), BLUE) { pickRegion() }
+        val regionBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        regionBody.addView(cell(t("Страна радио", "Radio country"), regionBtn))
+        regionBody.addView(TextView(this).apply {
+            text = t("Этот код уходит ASCII-байтами в кадре 07:30 при каждом применении FCC — вручную, из авто-FCC " +
+                     "и из плавающего меню. AU проверен на железе; остальные коды прошивка принимает, но с ними никто не летал.",
+                     "This code goes out as the ASCII bytes of the 07:30 frame on every FCC apply — manual, auto and " +
+                     "from the floating menu. AU is the hardware-confirmed one; the rest are codes the firmware takes " +
+                     "but nobody has flown.")
+            setTextColor(MUTED); textSize = 10.5f; setLineSpacing(dp(2).toFloat(), 1f); setPadding(0, dp(6), 0, 0)
+        })
+        val regionCard = card(t("🌍 Регион FCC", "🌍 FCC region"), regionBody)
+
         val updBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         updBody.addView(cell(t("Проверять при запуске", "Check on launch"),
             mkSwitch(AppState.autoUpdateCheck).apply {
@@ -539,13 +636,32 @@ class MainActivity : Activity() {
         updBody.addView(rowc(smallBtn(t("🔄 Проверить сейчас", "🔄 Check now"), BLUE) { checkUpdates(manual = true) }), rowLp())
         val updateCard = card(t("⬆️ Обновления", "⬆️ Updates"), updBody)
 
-        val langCard = card(t("🌍 Язык интерфейса", "🌍 Interface language"),
+        val langCard = card(t("🌐 Язык интерфейса", "🌐 Interface language"),
             cell(if (AppState.uiRu) "Русский" else "English",
                  smallBtn(t("Switch to English", "Переключить на русский"), BLUE) { toggleLanguage() }))
 
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(10), dp(12), dp(4)) }
-        col.addView(servicesCard); col.addView(profileCard); col.addView(updateCard); col.addView(langCard)
+        col.addView(profileCard); col.addView(regionCard); col.addView(updateCard); col.addView(langCard)
         return ScrollView(this).apply { addView(col); isFillViewport = true }
+    }
+
+    /** Pick the radio country every FCC command writes. The list is [FccRegion] —
+     *  the codes the firmware was observed to accept, and no free-text entry: a code
+     *  it does not know is a frame the radio silently ignores. */
+    private fun pickRegion() {
+        val all = FccRegion.values()
+        val sel = all.indexOf(AppState.fccRegion).coerceAtLeast(0)
+        android.app.AlertDialog.Builder(this)
+            .setTitle(t("Регион FCC", "FCC region"))
+            .setSingleChoiceItems(all.map { it.display() }.toTypedArray(), sel) { dlg, which ->
+                AppState.setFccRegion(this, all[which])
+                regionBtn.text = AppState.fccRegion.display()
+                setStatus(t("регион FCC: ", "FCC region: ") + AppState.fccRegion.display() +
+                    t(" — применится при следующем включении FCC", " — takes effect on the next FCC apply"))
+                dlg.dismiss()
+            }
+            .setNegativeButton(t("Закрыть", "Close"), null)
+            .show()
     }
 
     // ---------- params page (load .dhp / .dhv2params, search, edit by hash) ----------
@@ -561,11 +677,12 @@ class MainActivity : Activity() {
     // One shared set of column weights: the fixed header and every row lay out
     // with these, which is what actually makes the columns line up. Name first,
     // actions last, mirroring the web editor's table.
-    private val PARAM_COLS = floatArrayOf(3.4f, 0.7f, 1.9f, 1.0f, 1.1f, 2.0f)
+    private val PARAM_COLS = floatArrayOf(3.1f, 0.7f, 1.7f, 0.9f, 1.0f, 1.8f, 1.0f)
     // Built per Activity instance, after App.onCreate has loaded the language.
     private val PARAM_HEADS = arrayOf(
         t("Имя", "Name"), t("Тип", "Type"), t("Диапазон", "Range"),
-        t("По умолч.", "Default"), t("Текущее", "Current"), t("Действия", "Actions"))
+        t("По умолч.", "Default"), t("Текущее", "Current"), t("Действия", "Actions"),
+        t("В меню", "Menu"))
     /** Values actually read off the aircraft, by name. A row shows the catalog's
      *  number in grey until its name lands here, then the live one in green — the
      *  same distinction the web editor makes. */
@@ -644,6 +761,12 @@ class MainActivity : Activity() {
             }, 0.9f)
             next(paramEditOnly, 1.5f)
         }
+        // What the last column is for. Without it the checkbox reads as another filter.
+        val pinHint = TextView(this).apply {
+            text = t("Галочка «В меню» закрепляет параметр в плавающем меню поверх DJI Fly (до ${OverlayParams.MAX} штук).",
+                     "The \"Menu\" tick pins a parameter to the floating menu over DJI Fly (up to ${OverlayParams.MAX}).")
+            setTextColor(MUTED); textSize = 10.5f
+        }
         // Backup reminder: a wrong value here writes straight to the flight
         // controller, and the only clean undo is a copy made before the edit.
         val warn = TextView(this).apply {
@@ -655,6 +778,7 @@ class MainActivity : Activity() {
         col.addView(warn, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { bottomMargin = dp(8) })
         col.addView(srcBar)
         col.addView(findBar, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) })
+        col.addView(pinHint, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(5) })
         col.addView(head, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(6) })
         col.addView(paramTable, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f))
         return col
@@ -792,6 +916,13 @@ class MainActivity : Activity() {
                 addView(paramAction(t("запись", "write")))
                 addView(paramAction(t("сброс", "reset")))
             })
+            addView(android.widget.CheckBox(this@MainActivity).apply {   // 6 pin to the floating menu
+                layoutParams = LinearLayout.LayoutParams(0, WRAP_CONTENT, PARAM_COLS[6])
+                setPadding(dp(6), 0, 0, 0)
+                minWidth = 0; minimumWidth = 0
+                buttonTintList = ColorStateList(
+                    arrayOf(intArrayOf(android.R.attr.state_checked), intArrayOf()), intArrayOf(GREEN, MUTED))
+            })
         }
 
         /** Rebind a recycled row. Every listener is re-attached here — a recycled
@@ -824,6 +955,38 @@ class MainActivity : Activity() {
             reset.visibility = if (d.editable && d.def.isNotEmpty()) View.VISIBLE else View.GONE
             write.setOnClickListener { openParamEditor(d) }
             reset.setOnClickListener { stageParamWrite(d, d.def, reset = true) }
+            bindPin(row.getChildAt(6) as android.widget.CheckBox, d)
+        }
+
+        /**
+         * The "В меню" checkbox: pin this parameter to the floating overlay.
+         *
+         * A CLICK listener, not a checked-change one — the state is also set from here
+         * on every rebind of a recycled row, and a change listener would fire the
+         * previous parameter's toggle on the way past. A click only ever comes from a
+         * finger.
+         *
+         * Only an editable parameter can be pinned: the overlay's rows write values,
+         * and a min == max entry has no value to write.
+         */
+        private fun bindPin(pin: android.widget.CheckBox, d: ParamCatalog.Def) {
+            pin.visibility = if (d.editable) View.VISIBLE else View.INVISIBLE
+            pin.isChecked = OverlayParams.contains(this@MainActivity, d.name)
+            pin.setOnClickListener {
+                val on = pin.isChecked
+                if (!OverlayParams.set(this@MainActivity, d, on)) {
+                    pin.isChecked = false
+                    setStatus(t("⚠ в плавающем меню уже ${OverlayParams.MAX} параметров — снимите галочку с ненужного",
+                                "⚠ the floating menu already holds ${OverlayParams.MAX} — untick one first"))
+                    return@setOnClickListener
+                }
+                val n = OverlayParams.list(this@MainActivity).size
+                setStatus(if (on)
+                    t("🎈 ${d.name} — в плавающем меню ($n/${OverlayParams.MAX}), появится при следующем открытии панели",
+                      "🎈 ${d.name} pinned to the floating menu ($n/${OverlayParams.MAX}) — shows next time the panel is opened")
+                    else t("${d.name} убран из плавающего меню ($n/${OverlayParams.MAX})",
+                           "${d.name} unpinned from the floating menu ($n/${OverlayParams.MAX})"))
+            }
         }
     }
 
@@ -1284,31 +1447,7 @@ class MainActivity : Activity() {
             .onFailure { setStatus(t("нечем открыть $url", "no app can open $url")) }
     }
 
-    // ---------- log page ----------
-    private fun buildLog(): View {
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(10), dp(12), dp(8)) }
-        col.addView(rowc(
-            smallBtn(t("Очистить", "Clear"), SLATE) { DiagLog.clear(); renderLog() },
-            smallBtn(t("Экспорт", "Export"), BLUE) { setStatus(t("сохранено: ", "saved: ") + DiagLog.export(applicationContext)); renderLog() },
-            smallBtn(t("Поделиться", "Share"), VIOLET) {
-                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, DiagLog.asText()) }, t("Отправить лог", "Share log")))
-            }))
-        // A real ScrollView (not TextView + ScrollingMovementMethod): the latter
-        // scrolls the text itself and paints a white text-selection highlight on the
-        // line under the finger while dragging, and every new log line reset the
-        // scroll. Here dragging is normal and highlight-free, and the tail is followed.
-        logView = TextView(this).apply {
-            setTextColor(INK); textSize = 10.5f; typeface = Typeface.MONOSPACE
-            setPadding(dp(10), dp(10), dp(10), dp(10))
-            setTextIsSelectable(false); highlightColor = Color.TRANSPARENT
-        }
-        logScroll = ScrollView(this).apply {
-            isFillViewport = true; background = pillBg(0xFF0C0E15.toInt(), dp(12)); addView(logView)
-        }
-        col.addView(logScroll, LinearLayout.LayoutParams(MATCH_PARENT, 0, 1f).apply { topMargin = dp(8) })
-        return col
-    }
+    // ---------- log rendering (the view itself is built by buildDiag) ----------
     private fun renderLog() {
         // Follow the tail only when the user is already at (near) the bottom, so
         // scrolling up to read isn't yanked back down when new lines arrive.
@@ -1341,52 +1480,112 @@ class MainActivity : Activity() {
                                     "✅ FCC frames sent · applied live · keepalive on")) }
         return true
     }
+    // ---------- live state, on request ----------
+    /**
+     * True only while [readStateNow]'s job is genuinely on the bus. The panel is
+     * allowed to say "reading…" ONLY when this is set — see [renderState].
+     */
+    @Volatile private var stateReading = false
+    private var stateReadJob: Job? = null
+
+    /**
+     * Read LED / GPS / flight mode until all three have answered.
+     *
+     * The old button set a flag that the render loop consumed with a single
+     * [FlightState.refresh]; whatever did not answer stayed null, and the note under
+     * the switches fell through to "reading…" — permanently, with nothing reading.
+     * So the panel claimed to be busy exactly when it was idle, which is the one
+     * thing a status line must never do (2026-08-19).
+     *
+     * The press now owns a job. It asks only for the values that are still missing,
+     * ONE AT A TIME — a 40007 window each, which is what the FC's racy replies want —
+     * and comes back for the ones that stayed silent until [STATE_READ_ROUNDS] rounds
+     * are spent or the foreground gate closes. Every value that lands is rendered
+     * immediately, so the panel fills in as it goes instead of all-or-nothing.
+     */
+    private fun readStateNow() {
+        if (stateReading) { setStatus(t("↻ чтение уже идёт…", "↻ already reading…")); return }
+        if (!ForegroundGate.readsAllowed()) {
+            setStatus(t("⚠ DJI Fly на переднем плане — переключитесь в это приложение, чтобы прочитать состояние",
+                        "⚠ DJI Fly is active — switch to this app to read state"))
+            return
+        }
+        stateReadJob?.cancel()
+        stateReading = true
+        renderState()
+        setStatus(t("↻ читаю состояние…", "↻ reading state…"))
+        stateReadJob = scope.launch {
+            var gateClosed = false
+            var rounds = 0
+            try {
+                while (isActive && rounds < STATE_READ_ROUNDS && FlightState.missing().isNotEmpty()) {
+                    rounds++
+                    for (item in FlightState.missing()) {
+                        if (!ForegroundGate.readsAllowed()) { gateClosed = true; break }
+                        val got = runCatching { FlightState.refreshOne(item) }.getOrDefault(false)
+                        runOnUiThread { runCatching { renderState(); renderDevice() } }
+                        if (!got) setStatus(t("↻ ${item.label}: нет ответа, повторяю…",
+                                              "↻ ${item.label}: no answer, retrying…"))
+                    }
+                    if (gateClosed) break
+                    if (FlightState.missing().isNotEmpty()) delay(STATE_READ_GAP_MS)
+                }
+            } finally {
+                stateReading = false
+                val left = FlightState.missing()
+                // Every value asked for, none answered, and the gate stayed open the
+                // whole time: that IS the "no drone on the link" verdict, so record it
+                // rather than leave the panel implying it was never asked.
+                if (!gateClosed && left.size == FlightState.Item.values().size) FlightState.markSilent()
+                if (left.size < FlightState.Item.values().size) StartupProbe.rememberModel(applicationContext)
+                runOnUiThread { runCatching { renderState(); renderDevice() } }
+                setStatus(when {
+                    gateClosed -> t("⚠ чтение прервано — DJI Fly вышел вперёд",
+                                    "⚠ read stopped — DJI Fly came to the front")
+                    left.isEmpty() -> t("✅ прочитано: LED, GPS и режим полёта",
+                                        "✅ read: LED, GPS and flight mode")
+                    left.size == FlightState.Item.values().size ->
+                        t("⚠ ни одно значение не ответило — дрон выключен или не на связи",
+                          "⚠ nothing answered — the drone is off or not linked")
+                    else -> t("⚠ не ответили: ", "⚠ no answer from: ") + left.joinToString(", ") { it.label }
+                })
+            }
+        }
+    }
+
     // ---------- live loops ----------
     private fun startLoops() {
         loopJob?.cancel()
         loopJob = scope.launch {
-            StartupProbe.run(applicationContext)
+            // NO probe here. StartupProbe opens ~15 sockets on 40007 (serial 00:51,
+            // up to 6 name-variant windows, then three param reads), and it used to run
+            // as the first statement of this coroutine — before the `foreground` check,
+            // before the read gate, on every Activity creation including a recreate from
+            // the language toggle. Measured 2026-08-19: entering this app and going back
+            // to DJI Fly loses FCC, while merely minimising Fly does not. That burst is
+            // the difference. The probe now runs only where it is worth its cost: the
+            // setup wizard, the "опрос" button, and /profile/detect.
             var lastEpoch = AircraftSession.epoch
-            var lastReadMs = 0L
             runOnUiThread { runCatching { renderDevice(); renderState() } }
             while (isActive) {
                 if (foreground) {
-                    // A serial change (different aircraft) bumps the session epoch —
-                    // re-probe so the new drone's variant/model replace the old, and
-                    // force one fresh live-state read.
+                    // A serial change (different aircraft) bumps the session epoch. The
+                    // cached per-drone state is already cleared by AircraftSession; what
+                    // is NOT done here any more is re-probing, because that is the same
+                    // 40007 burst as above and an aircraft change is exactly when DJI Fly
+                    // is busy establishing its link. The panel shows what is known and the
+                    // "опрос" button re-probes when the user wants it.
                     if (AircraftSession.epoch != lastEpoch) {
                         lastEpoch = AircraftSession.epoch
-                        StartupProbe.run(applicationContext)
-                        refreshNow = true
+                        DiagLog.info("aircraft changed — not re-probing (40007 stays quiet); " +
+                                     "use the probe button to refresh")
                     }
-                    // The ONLY reliable "drone connected" signal is a flight-controller
-                    // read answering (40009 is identical drone on/off — proven live).
-                    // That read opens DJI Fly's port (40007), so we do it ONLY while
-                    // our app is in front — i.e. Fly is backgrounded and nobody is
-                    // watching its video, the exact case ForegroundGate marks safe —
-                    // at a gentle 15 s cadence (far below the churn that dropped links
-                    // in SkylabFCCfree v1.5.78). During flight (Fly in front) reads are
-                    // blocked and the link shows "unknown". Events (onResume / write /
-                    // aircraft change) still force an immediate read via refreshNow.
-                    // Live connect/LED/GPS/mode status. The read now goes through
-                    // FlightState.refresh → ParamRead.readMany: ONE 40007 socket for all
-                    // three params, with a strict mid-window abort the instant DJI Fly
-                    // takes the foreground. That is cheap enough to keep on a timer AND on
-                    // events (refreshNow: onResume / a write / an aircraft change) without
-                    // the old multi-socket burst that dropped Fly's link on a switch.
-                    // NO timed polling. Reading LED/GPS/mode puts frames on 40007, and
-                    // measured on hardware that traffic competes with an FCC apply badly
-                    // enough to cost it frames. The state is now read only when something
-                    // actually asks: opening the screen, a write, or an aircraft change
-                    // (refreshNow). Manual by request — see doc/fcc-autoapply-tests.md.
-                    if (refreshNow && ForegroundGate.readsAllowed()) {
-                        refreshNow = false
-                        lastReadMs = System.currentTimeMillis()
-                        runCatching { FlightState.refresh() }
-                        StartupProbe.rememberModel(applicationContext)
-                    } else if (refreshNow) {
-                        refreshNow = false   // Fly active — can't read; don't spin
-                    }
+                    // NO reads on this tick, timed or otherwise. Reading LED/GPS/mode puts
+                    // frames on 40007 — DJI Fly's video mirror — and measured on hardware
+                    // that traffic competes with an FCC apply badly enough to cost it
+                    // frames. State is read only when something actually asks: the
+                    // "Прочитать состояние" button ([readStateNow]) or a write. This loop
+                    // only RENDERS, from cached state plus passive serial/model updates.
                     flyStat = flyStatus()   // socket-free (a11y-derived)
                     runOnUiThread { runCatching { renderDevice(); renderState() } }
                 }
@@ -1394,7 +1593,6 @@ class MainActivity : Activity() {
             }
         }
     }
-
     private fun renderDevice() {
         // Self-heal the FCC button's caption: the keepalive can also be switched from the
         // web dashboard or stop on its own, and this is the periodic tick that notices.
@@ -1413,36 +1611,14 @@ class MainActivity : Activity() {
                 else -> if (AppState.litoMode) "Lito" else "g_config.*"
             })
         sb.append('\n').append("Fly:   ").append(flyStat)
-        sb.append('\n').append(t("линк:  ", "link:  ")).append(
-            // The ONLY reliable "drone is powered" signal on RC2 is a flight-
-            // controller read answering (40009 shows only the controller's own
-            // radio, identical drone on/off). That read runs only while our app is
-            // in front (Fly backgrounded); during flight we honestly say unknown.
-            when {
-                FlightState.connected == true -> t("дрон подключён (чтение FLYC прошло)", "drone connected (FLYC read OK)")
-                // Passive OSD confirms a live aircraft even when reads are blocked
-                // (Fly active) — but only ever as a POSITIVE; absent OSD ≠ no drone
-                // (the aux reader may simply be off), so it never turns the line red.
-                DroneLink.connected() -> t("дрон подключён (живой OSD)", "drone connected (live OSD)")
-                !ForegroundGate.readsAllowed() -> t("неизвестно — DJI Fly впереди", "unknown — DJI Fly active")
-                FlightState.probed -> t("дрона нет (FLYC молчит)", "no drone (FLYC silent)")
-                else -> t("читаю…", "reading…")
-            })
+        // No "link:" line. Deciding whether a drone is on the link needs a
+        // flight-controller read, and those only happen when the user asks for one now
+        // — so the panel would be reporting a fact it does not have. The result of an
+        // explicit read is shown under the LED / GPS / mode switches instead.
         deviceView.text = sb.toString()
         if (::litoSw.isInitialized) litoSw.isChecked = AppState.litoMode
-        // Keep the main-screen auto-start switches in sync (Services page / diag can change them).
-        if (::mainKaAuto.isInitialized) {
-            mainKaAuto.isChecked = AppState.autoKeepalive
-            mainDiagAuto.isChecked = AppState.autoDiag
-            mainOvAuto.isChecked = AppState.autoOverlay
-        }
-        // Show/refresh the web-dashboard URL in the auto-start block while diag runs.
-        if (::mainDiagUrl.isInitialized) updateDiagUrl(DiagServer.isRunning)
-        if (::linkDot.isInitialized) when {
-            FlightState.connected == true || DroneLink.connected() -> { linkDot.text = t("дрон ●", "drone ●"); linkDot.setTextColor(GREEN) }
-            FlightState.connected == false -> { linkDot.text = t("дрон ○", "drone ○"); linkDot.setTextColor(CORAL) }
-            else -> { linkDot.text = t("дрон …", "drone …"); linkDot.setTextColor(AMBER) }   // unknown (Fly active / not read yet)
-        }
+        // The web dashboard can flip these from a browser; this is the tick that notices.
+        syncServiceSwitches()
         summary.text = "⚡ " + (if (d.code.isNotEmpty()) d.name else "DJI_FCC_GPSOFF") +
             (if (rc.code.isNotEmpty()) "  ·  ${rc.name}" else "")
     }
@@ -1461,16 +1637,28 @@ class MainActivity : Activity() {
         set(modeVal, modeSw, FlightState.cine?.let { !it }, "ATTI", "Cine")
         // Switches always stay enabled: a "no read-back" drone still takes blind
         // writes, per the honesty note above.
+        // "Reading…" is claimed ONLY while readStateNow's job is on the bus, and it
+        // says how much is left — the note used to fall through to a permanent
+        // "reading…" with nothing reading behind it (fixed 2026-08-19).
+        val left = FlightState.missing().size
         stateNote.text = when {
+            stateReading -> t("читаю… осталось $left из 3", "reading… $left of 3 left")
             !ForegroundGate.readsAllowed() -> t("DJI Fly впереди — чтение приостановлено (переключитесь в это приложение)",
                                                 "DJI Fly is active — reads paused (switch to this app to read state)")
-            FlightState.connected == true -> t("вживую · обновлено ${(System.currentTimeMillis() - FlightState.lastMs) / 1000} с назад",
-                                              "live · updated ${(System.currentTimeMillis() - FlightState.lastMs) / 1000}s ago")
+            FlightState.connected == true && left == 0 ->
+                t("вживую · обновлено ${(System.currentTimeMillis() - FlightState.lastMs) / 1000} с назад",
+                  "live · updated ${(System.currentTimeMillis() - FlightState.lastMs) / 1000}s ago")
+            FlightState.connected == true ->
+                t("прочитано частично ($left из 3 без ответа) — «Прочитать состояние», чтобы дочитать",
+                  "partly read ($left of 3 unanswered) — tap Read state to finish")
             FlightState.readsWork -> t("последнее известное — сейчас чтения нет (дрон выключен? нажмите «Прочитать состояние»)",
                                        "last known — no live read now (drone off? tap Read state)")
             StartupProbe.readsFailed -> t("этот дрон не отвечал на чтения — переключатели пишут вслепую, состояние неизвестно",
                                           "this drone did not answer reads — switches write blind, state unknown")
-            else -> t("читаю…", "reading…")
+            FlightState.probed -> t("ни одно значение не ответило — дрон выключен или не на связи",
+                                    "nothing answered — the drone is off or not linked")
+            else -> t("состояние ещё не читалось — нажмите «Прочитать состояние»",
+                      "state has not been read yet — tap Read state")
         }
     }
 
@@ -1599,7 +1787,11 @@ class MainActivity : Activity() {
     // ---------- lifecycle / permissions ----------
     override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); setIntent(intent); handleIntent(intent) }
     override fun onResume() {
-        super.onResume(); foreground = true; refreshNow = true; syncSwitches()
+        // No automatic read here. Coming back to this screen used to force a live-state read
+        // on 40007 — the port DJI Fly mirrors video on — which is half of why switching
+        // between the two apps costs FCC (2026-08-19). State is read when asked for: the
+        // "Прочитать состояние" button, or after a write.
+        super.onResume(); foreground = true; syncSwitches()
     }
     /**
      * Leaving this screen stops 40007 reads **immediately**, whatever we are leaving for.
@@ -1623,13 +1815,23 @@ class MainActivity : Activity() {
     }
 
     private fun syncSwitches() {
-        if (::kaSw.isInitialized) {
-            kaSw.isChecked = FccKeepaliveService.running
-            diagSw.isChecked = DiagServer.isRunning
-            ovSw.isChecked = OverlayService.running
-            updateDiagUrl(DiagServer.isRunning)
-        }
+        syncServiceSwitches()
         syncFccButtonLabel()
+    }
+
+    /**
+     * Put the service switches back in step with the persisted intent.
+     *
+     * Deliberately NOT the services' own `running` flags: those lag start()/stop()
+     * by a moment, so a switch tapped a second ago would visibly bounce back. The
+     * flag is what a tap sets, synchronously, and since the tap also starts or stops
+     * the service the two agree.
+     */
+    private fun syncServiceSwitches() {
+        if (::kaSw.isInitialized) kaSw.isChecked = AppState.autoKeepalive
+        if (::ovSw.isInitialized) ovSw.isChecked = AppState.autoOverlay
+        if (::diagSw.isInitialized) diagSw.isChecked = AppState.autoDiag
+        updateDiagUrl(DiagServer.isRunning)
     }
 
     /**
@@ -1652,8 +1854,7 @@ class MainActivity : Activity() {
     }
     private fun updateDiagUrl(on: Boolean) {
         val txt = if (on) t("▶ открыть на ПК:  ", "▶ open on PC:  ") + "http://${localIp()}:${DiagServer.PORT}/" else ""
-        if (::mainDiagUrl.isInitialized) { mainDiagUrl.text = txt; mainDiagUrl.visibility = if (on) View.VISIBLE else View.GONE }
-        if (::diagUrl.isInitialized) diagUrl.text = txt
+        if (::diagUrl.isInitialized) { diagUrl.text = txt; diagUrl.visibility = if (on) View.VISIBLE else View.GONE }
     }
 
     private fun applyAutoStart() {
@@ -1789,24 +1990,12 @@ class MainActivity : Activity() {
         r.addView(control)
         return r
     }
-    /** A named service row: bold title + a one-line "what it does" + the control. */
-    private fun serviceItem(name: String, desc: String, control: View): View {
-        val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-        top.addView(TextView(this).apply { text = name; setTextColor(INK); textSize = 14f; typeface = Typeface.DEFAULT_BOLD },
-            LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        top.addView(control)
-        col.addView(top)
-        col.addView(TextView(this).apply { text = desc; setTextColor(MUTED); textSize = 11f; setLineSpacing(dp(2).toFloat(), 1f); setPadding(0, dp(2), dp(44), 0) })
-        return col
-    }
     private fun smallBtn(text: String, color: Int, onClick: () -> Unit) = Button(this).apply {
         this.text = text; isAllCaps = false; textSize = 12f; setTextColor(Color.WHITE); typeface = Typeface.DEFAULT_BOLD
         minHeight = dp(34); minimumHeight = dp(34); minWidth = 0; minimumWidth = 0
         setPadding(dp(6), dp(5), dp(6), dp(5)); background = pillBg(color, dp(12)); stateListAnimator = null
         setOnClickListener { onClick() }
     }
-    private fun serviceSwitch(onSet: (Boolean) -> Unit) = mkSwitch(false).apply { setOnClickListener { onSet(isChecked) } }
     private fun mkSwitch(checked: Boolean) = Switch(this).apply {
         isChecked = checked
         thumbTintList = ColorStateList.valueOf(Color.WHITE)
@@ -1847,8 +2036,8 @@ class MainActivity : Activity() {
         private const val REQ_DHP = 4004
         private const val REQ_NOTIF = 4005
         /** UI re-render cadence — socket-free (renders cached state + passive
-         *  serial/model updates). Live-state reads that open 40007 are event-driven
-         *  ([refreshNow]), never on this tick. */
+         *  serial/model updates). Live-state reads that open 40007 happen only on
+         *  request ([readStateNow]), never on this tick. */
         private const val RENDER_INTERVAL_MS = 3_000L
         /** Max cadence of Log-page re-renders (coalesces bursty log output). */
         private const val LOG_RENDER_THROTTLE_MS = 400L
@@ -1859,9 +2048,13 @@ class MainActivity : Activity() {
         /** How long reads stay blocked after this screen loses the foreground. Covers a
          *  full app switch; a real window event lifts it sooner in either direction. */
         private const val LEAVING_BLOCK_MS = 3_000L
-        /** Cadence of the live status read (connect + LED/GPS/mode), ONLY while our app
-         *  is in front (Fly backgrounded). One batched 40007 socket, strict abort. */
         /** Coalesce typing in the params search box (see [paramRenderTick]). */
         private const val PARAM_SEARCH_DEBOUNCE_MS = 200L
+        /** How many times [readStateNow] comes back for values that did not answer.
+         *  Each round is one 40007 read window per still-missing value; a value that is
+         *  going to answer at all normally does within the first couple of rounds. */
+        private const val STATE_READ_ROUNDS = 4
+        /** Pause between those rounds, so a silent flight controller is not hammered. */
+        private const val STATE_READ_GAP_MS = 500L
     }
 }
