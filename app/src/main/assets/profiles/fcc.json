@@ -1,9 +1,10 @@
 {
   "name": "FCC",
-  "_source": "Reduced from FreeFCC's 21-frame fcc.json to ONE frame on 2026-08-19 by frame-subset experiments on RC 2 + Lito X1. See doc/fcc-minimal-sequence.md — this single write raises transmit power AND enables 5.8 GHz. See _cadence for how many times it has to be sent. The 21-frame original is kept beside this file as fcc_full.json.",
-  "_why_one_frame": "The other 20 frames were removed in seven experiments (E1-E7), each verified against DJI Fly's Transmission page. The profile resisted per-frame shrinking for so long because power is reachable by TWO independent paths — the radio core (RADIO region/commit + SDR registers) and this WIFI channel-group write — so dropping any single frame left the effect standing.",
-  "_cadence": "EIGHT sends of that one frame, one second apart (rounds=8, inter_round_delay_ms=1000 — ProfileRunner opens a fresh connection per round). Measured 2026-08-19 18:25: a SINGLE send does not take on a live session — it failed over 20 s of watching, twice, after a genuine aircraft power cycle. A one-second burst landed on the 3rd and 4th shot both times. Two sends 100 ms apart inside one connection did NOT work, so what matters is separate sends spaced in time, not repetition as such. Eight is double what was needed.",
-  "_removed_repeats": "The follow-up ce_regulatory_level=01 write is gone: it never stuck — reads back ff whether FCC is on or off (2026-08-19, doc/fcc-autoapply-tests.md).",
+  "_source": "Two frames, cut from FreeFCC's 21 by subset experiments on RC 2 + Lito X1, 2026-08-19. See doc/fcc-minimal-sequence.md. The 21-frame original is kept beside this file as fcc_full.json.",
+  "_roles": "The two effects have SEPARATE owners, each verified alone: 09:27 (SDR register 0xffff0048=2, setForceFcc) raises transmit power and gives no 5.8; 07:30 (WIFI channel group, ASCII AU twice) gives the 5.8 band. Both are needed for the full switch.",
+  "_why_not_fewer": "07:30 alone switches BOTH live but does NOT survive a DJI Fly restart. Adding this one SDR register makes it survive. Region set + commit (06:72), the AUTOTEST service-mode wrapper (10:58), RADIO param (06:8C), the channel map/flag (07:18/07:19), the second SDR register (0xffff0063=3) and every flight-controller parameter write were each tested and dropped — none is needed.",
+  "_cadence": "EIGHT sends, one second apart (rounds=8, inter_round_delay_ms=1000 — ProfileRunner opens a fresh connection per round). A single send does not take on a live session: measured 2026-08-19, it failed over 20 s of watching, twice, while a one-second burst landed on the 3rd and 4th shot. Two sends 100 ms apart inside one connection did NOT work, so what matters is separate sends spaced in time.",
+  "_reverting": "The same 07:30 with another two-letter code puts the radio back — RU (this aircraft's own country, ISO 643) returns CE live, no reboot. Codes the firmware takes: AU, CN, US, BO, RU, NL, MY.",
   "sender": 130,
   "sender_desc": "MOBILE_APP, index 4",
   "cmd_type": 32,
@@ -14,6 +15,7 @@
   "read_window_ms": 50,
   "port": 40009,
   "frames": [
-    { "s": 7, "i": 48, "d": 9, "p": "41550000415500000100", "note": "WIFI channel group — the whole switch" }
+    { "s": 9, "i": 39, "d": 9, "p": "00024800ffff0200000000", "note": "SDR reg 0xffff0048=2 setForceFcc — transmit power" },
+    { "s": 7, "i": 48, "d": 9, "p": "41550000415500000100", "note": "WIFI channel group AU — the 5.8 band" }
   ]
 }
