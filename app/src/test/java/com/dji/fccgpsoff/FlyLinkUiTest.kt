@@ -221,6 +221,17 @@ class FlyLinkUiTest {
         assertEquals("a 1 s blip must not fire a burst", 1L, FlyLink.generation)
     }
 
+    @Test fun `connectedForMs measures the aircraft's age on the link`() {
+        assertEquals(-1L, FlyLink.connectedForMs())          // nothing observed yet
+        FlyLink.observeScreen(listOf("Режим N"), fpvConnected)
+        assertEquals(0L, FlyLink.connectedForMs())
+        now += 7_000
+        assertEquals(7_000L, FlyLink.connectedForMs())
+        // Not linked -> no age at all, so the settle gate cannot fire on a dead link.
+        FlyLink.observeScreen(listOf("N/A"), listOf("N/A"))
+        assertEquals(-1L, FlyLink.connectedForMs())
+    }
+
     @Test fun `a tick-sized hiccup does not re-arm`() {
         FlyLink.observeScreen(listOf("Режим N"), fpvConnected)
         assertEquals(1L, FlyLink.generation)

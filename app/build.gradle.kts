@@ -27,8 +27,8 @@ android {
         // Bumped on EVERY build, debug and release — see CLAUDE.md. The value is
         // printed at startup and served by the diag server, so a live controller
         // can always be asked which build it is actually running.
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 11
+        versionName = "1.0.10"
 
         ndk {
             // The ABIs DJI smart controllers ship.

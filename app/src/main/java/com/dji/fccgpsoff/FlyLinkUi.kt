@@ -162,6 +162,14 @@ object FlyLink {
     /** Fly says there is NO aircraft — the case where applying FCC is pointless. */
     fun disconnected(): Boolean = state == FlyLinkUiState.DISCONNECTED
 
+    /**
+     * How long the aircraft has been continuously linked, in ms — or -1 when it is
+     * not linked (or we cannot tell). Measured from the reading that flipped the
+     * state to CONNECTED, so it is the aircraft's age on the link, not the app's.
+     */
+    fun connectedForMs(): Long =
+        if (state == FlyLinkUiState.CONNECTED && sinceMs != 0L) clock() - sinceMs else -1
+
     /** ms since the last usable observation, or -1 if there has never been one. */
     fun ageMs(): Long = if (lastSeenMs == 0L) -1 else clock() - lastSeenMs
 

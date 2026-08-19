@@ -18,8 +18,12 @@ import kotlinx.coroutines.launch
 enum class KeepaliveMode(val wire: String, val label: String) {
     /** Event-driven: replay when the aircraft records its home point. No idle traffic. */
     HOME_POINT("home_point", "on home point"),
-    /** Timer: a read-only 07:19 country probe every 5 s, replay only on drift. */
-    PERIODIC("periodic", "5 s country check");
+    /** Timer-driven replay. Historically a 5 s country probe decided when to
+     *  replay; that probe never answered on RC 2 (0 of 408 reads) and was removed,
+     *  so this now differs from [HOME_POINT] in name only — both replay on the
+     *  aircraft-session edge plus the blind cadence. Kept because it is persisted
+     *  in prefs and offered by the diag page. */
+    PERIODIC("periodic", "timed replay");
 
     companion object {
         fun of(s: String?): KeepaliveMode = values().firstOrNull { it.wire == s } ?: HOME_POINT
@@ -36,11 +40,10 @@ enum class KeepaliveMode(val wire: String, val label: String) {
  *
  * Which is why nothing here replays the profile on a bare timer. Both modes
  * (see [KeepaliveMode]) apply once at start, then wait for evidence that the
- * region actually moved: [HOME_POINT][KeepaliveMode.HOME_POINT] watches the
- * passive 03:44 home-point bit (zero frames while idle),
- * [PERIODIC][KeepaliveMode.PERIODIC] asks one 07:19 country question every 5 s.
- * The old unconditional 2 s replay put 21 frames x 2 rounds (~1.5 s of writes)
- * on the shared bus 30 times a minute for nothing.
+ * region actually moved: a new aircraft session on DJI Fly's screen, plus a
+ * blind cadence for what cannot be observed. The old unconditional 2 s replay put
+ * 21 frames x 2 rounds (~1.5 s of writes) on the shared bus 30 times a minute for
+ * nothing.
  */
 class FccKeepaliveService : Service() {
 
@@ -214,6 +217,7 @@ class FccKeepaliveService : Service() {
         var sinceLink = 0
         var deferredLogged = false
         var goneLogged = false
+        var linkYoungLogged = false
         var holdUntil = Long.MAX_VALUE
         while (isActive) {
             // The aircraft left mid-window (battery swap, power-cycle, range loss).
@@ -240,6 +244,26 @@ class FccKeepaliveService : Service() {
                 goneLogged = false
                 sinceLink = 0          // the aircraft is back: it earns fresh fast knocks
             }
+            // Let the AIRCRAFT settle before the first burst of a session.
+            //
+            // Distinct from the DJI Fly settle below, which measures how long Fly has
+            // held the foreground — when Fly has been in front for minutes and a drone
+            // is then powered on, that gate is already satisfied and we fired ~0.3 s
+            // after the link appeared. Across every measurement those earliest applies
+            // (+0.3, +5, +10, +15 s) never took, while a later one did; the aircraft is
+            // still bringing itself up and refuses the region write. Waiting costs
+            // nothing we were getting anyway.
+            val linkedFor = FlyLink.connectedForMs()
+            if (linkedFor in 0 until LINK_SETTLE_MS) {
+                if (!linkYoungLogged) {
+                    linkYoungLogged = true
+                    DiagLog.info("keepalive: aircraft linked ${linkedFor / 1000}s ago — letting it settle ${LINK_SETTLE_MS / 1000}s before applying")
+                }
+                delay(WATCH_TICK_MS)
+                deadline = System.currentTimeMillis() + BOOTSTRAP_WINDOW_MS   // don't burn the window waiting
+                continue
+            }
+            linkYoungLogged = false
             if (ForegroundGate.flySettling(FLY_SETTLE_MS)) {
                 if (!deferredLogged) {
                     deferredLogged = true
@@ -286,11 +310,10 @@ class FccKeepaliveService : Service() {
      * (SDR/radio), where the flight-controller's OSD (03:44) never arrives — proven
      * live, `HomePointMonitor` sees 0 frames — so it silently never fires; and once
      * FCC is on it doesn't drop at the home-point moment anyway. Instead we VERIFY on
-     * 40009 itself: read the 07:19 country every [VERIFY_INTERVAL_MS]; if it drifted
-     * off [FccCountry.TARGET] (Fly re-pushed CE) re-apply at once, and if the read
-     * never answers (injected reads often don't route back on RC2) blind-re-apply
-     * every [BLIND_APPLY_MS] so a relink is corrected even with no reply. All on
-     * 40009, never DJI Fly's 40007 — minimal impact on Fly, and independent of GPS.
+     * 40009 itself. There is nothing to read back — the 07:19 country probe that
+     * used to run here never answered on this hardware and was removed — so replay
+     * is driven by the aircraft-session edge plus a blind cadence. All on 40009,
+     * never DJI Fly's 40007 — minimal impact on Fly, and independent of GPS.
      *
      * The blind timer is now the LAST resort, not the main path: [FlyLink] reports a
      * new aircraft session straight off DJI Fly's screen, and that edge re-runs the
@@ -300,9 +323,9 @@ class FccKeepaliveService : Service() {
      */
     private suspend fun CoroutineScope.maintain(features: Features) {
         var lastApplyMs = System.currentTimeMillis()
-        var lastCountry: String? = TARGET_SENTINEL
         var deferredLogged = false
         var lastSession = FlyLink.generation
+        var sessionStartedMs = System.currentTimeMillis()
         var idleLogged = false
         var nextVerifyMs = System.currentTimeMillis() + VERIFY_INTERVAL_MS
         while (isActive) {
@@ -310,8 +333,8 @@ class FccKeepaliveService : Service() {
             // so a new aircraft session waited up to VERIFY_INTERVAL_MS to be noticed —
             // measured on hardware: the screen saw the aircraft at 08:49:19.1 and the
             // apply started at 08:49:22.3, 3.2 s of it spent asleep here. The 07:19
-            // country read still runs on its own slower schedule below; only the edge
-            // check got faster, and it costs nothing (a volatile read).
+            // replay decision still runs on its own slower schedule below; only the
+            // edge check got faster, and it costs nothing (a volatile read).
             delay(EDGE_TICK_MS)
 
             // A NEW aircraft session on DJI Fly's screen — the drone was power-cycled,
@@ -335,14 +358,14 @@ class FccKeepaliveService : Service() {
                     continue
                 }
                 DiagLog.info("keepalive: DJI Fly shows a new aircraft session (#$session) — applying FCC for it")
+                sessionStartedMs = System.currentTimeMillis()
                 bootstrapApply(features)
                 lastApplyMs = System.currentTimeMillis()
-                lastCountry = TARGET_SENTINEL
                 continue
             }
 
-            // No aircraft on the link: the country read cannot answer and a blind
-            // replay would configure nothing. Stay off the bus until one shows up.
+            // No aircraft on the link: a replay would configure nothing. Stay off
+            // the bus until one shows up.
             if (FlyLink.disconnected()) {
                 if (!idleLogged) {
                     idleLogged = true
@@ -354,14 +377,27 @@ class FccKeepaliveService : Service() {
 
             if (System.currentTimeMillis() < nextVerifyMs) continue
             nextVerifyMs = System.currentTimeMillis() + VERIFY_INTERVAL_MS
-            val country = FccCountry.read()
-            if (country != lastCountry) {
-                lastCountry = country; DiagLog.info("keepalive: country = ${country ?: "no reply"}")
-            }
-            val drifted = country != null && country != FccCountry.TARGET
-            val blind = !drifted && country == null && System.currentTimeMillis() - lastApplyMs >= BLIND_APPLY_MS
-            if (drifted || blind) {
-                val why = if (country != null) "region drifted to $country" else "unverifiable — blind"
+
+            // Replay is time-driven, full stop. There is no read to gate it on: the
+            // 07:19 country probe that used to run here answered 0 times out of 408
+            // across every recorded session — this hardware does not route injected
+            // reads back — so `drifted` never fired and `verified` never suppressed a
+            // replay. It was not free either: each read was a fresh connection to a
+            // broker that evicts its current client on every connect, ~11 evictions a
+            // minute spent competing with DJI Fly for the single slot, feeding the very
+            // contention that kept FCC from landing. Removed entirely; `/country` is
+            // still there for a manual probe on hardware that does answer.
+            //
+            // Cadence: short while the aircraft is young, long once it has settled.
+            // Measured on v1.0.1 with the burst no longer disturbing the link: five
+            // applies in the first 45 s did NOT take, then nothing was sent for 97 s —
+            // and FCC appeared 4 s after the very next apply. The aircraft becomes
+            // willing at a moment of its own, and a fixed 90 s gap slept through it.
+            val youngSession = System.currentTimeMillis() - sessionStartedMs < EARLY_WINDOW_MS
+            val blindEvery = if (youngSession) EARLY_BLIND_APPLY_MS else BLIND_APPLY_MS
+            val due = System.currentTimeMillis() - lastApplyMs >= blindEvery
+            if (due) {
+                val why = "unverifiable — blind"
                 // Never reconfigure the radio while DJI Fly's session is still coming up.
                 // Measured: the same burst on a settled link is invisible, but landing it in
                 // the first seconds after Fly takes the front costs Fly the connection. Not
@@ -378,7 +414,6 @@ class FccKeepaliveService : Service() {
                 deferredLogged = false
                 DiagLog.info("keepalive: re-applying FCC ($why)")
                 runCatching { features.applyFcc() }; lastApplyMs = System.currentTimeMillis()
-                lastCountry = TARGET_SENTINEL
             }
         }
     }
@@ -414,6 +449,29 @@ class FccKeepaliveService : Service() {
          *  reconnect, but applies FCC ~twice as fast after a controller/aircraft reboot. */
         private const val FLY_SETTLE_MS = 10_000L
 
+        /**
+         * How long the AIRCRAFT must have been on the link before the first apply of
+         * a session. Separate from [FLY_SETTLE_MS], which is about DJI Fly's window,
+         * not the drone — see the call site in bootstrapApply.
+         *
+         * Measured directly, one apply per drone power-cycle with the keepalive off
+         * (the `/applyat` harness, so nothing else could be credited):
+         *
+         *     +0 s  -> never applied      +10 s -> applied
+         *     +5 s  -> never applied      +30 s -> applied
+         *
+         * Seven single-shot runs put the threshold between 15 and 30 s: +0, +5, +10 and
+         * +15 all failed, +30 worked twice. (One +10 run did succeed; it is a lone
+         * outlier against six consistent runs and is not explained.)
+         *
+         * So this value is NOT "the moment that works" — the first burst at +15 will
+         * usually be too early. It only skips the window that provably never works;
+         * the retries after it are what actually land. Bursts are cheap and measurably
+         * do not disturb the link (16 applies, zero correlated drops), so keeping the
+         * floor low costs nothing and covers the case where the threshold is lower.
+         */
+        private const val LINK_SETTLE_MS = 15_000L
+
         private const val CHANNEL = "fcc_keepalive"
         private const val NOTIF_ID = 1001
 
@@ -429,6 +487,17 @@ class FccKeepaliveService : Service() {
          *  Verification by parameter read is what makes a long interval safe: whenever our
          *  app is in front, the read confirms FCC and pushes this deadline out. */
         private const val BLIND_APPLY_MS = 90_000L
+        /** Replay cadence while the aircraft is still young. This is what actually
+         *  covers a cold boot: the settle above cannot, because the moment the aircraft
+         *  becomes willing depends on how long it was unpowered. Cheap to repeat now —
+         *  three connections per apply, and no link disturbance. */
+        private const val EARLY_BLIND_APPLY_MS = 30_000L
+        /** How long an aircraft counts as young after its session opened. */
+        private const val EARLY_WINDOW_MS = 5 * 60_000L
+        /** Silent country reads before the probe is muted (see the call site). */
+        private const val COUNTRY_GIVE_UP_AFTER = 3
+        /** How often a muted probe is retried, in case this hardware does answer. */
+        private const val COUNTRY_RETRY_MS = 5 * 60_000L
         /** Poll cadence while waiting for the first telemetry (awaitLink). */
         private const val WATCH_TICK_MS = 500L
         /** How long awaitLink waits for an OSD confirmation before applying FCC blind
@@ -457,7 +526,7 @@ class FccKeepaliveService : Service() {
          * race a link that is still coming up. This is its cheap second chance.
          * Writes land at roughly 0, 5, 19, 33, 47… seconds after the link appears.
          */
-        private const val BOOTSTRAP_FAST_TRIES = 2
+        private const val BOOTSTRAP_FAST_TRIES = 1
         private const val BOOTSTRAP_FAST_REAPPLY_MS = 3_000L
         /** How often the maintenance loop re-checks fast-moving state (the session edge). */
         private const val EDGE_TICK_MS = 500L
@@ -473,8 +542,6 @@ class FccKeepaliveService : Service() {
         /** Loopback ports the DUML broker may listen on, in scan order. 40007 is
          *  deliberately excluded: probing DJI Fly's video mirror blips its video. */
         private val PROXY_PORTS = intArrayOf(DumlWire.PORT_FCC, DumlWire.PORT_INJECT, 8901, 8902, 8903, 8904)
-        /** Not a country code, so the first tick always logs what it saw. */
-        private const val TARGET_SENTINEL = "??"
 
         fun start(ctx: Context, mode: KeepaliveMode = AppState.keepaliveMode) =
             ForegroundServices.launch(ctx, FccKeepaliveService::class.java) { putExtra(EXTRA_MODE, mode.wire) }

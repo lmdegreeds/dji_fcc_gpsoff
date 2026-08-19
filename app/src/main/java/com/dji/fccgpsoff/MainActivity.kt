@@ -1374,8 +1374,12 @@ class MainActivity : Activity() {
                     // takes the foreground. That is cheap enough to keep on a timer AND on
                     // events (refreshNow: onResume / a write / an aircraft change) without
                     // the old multi-socket burst that dropped Fly's link on a switch.
-                    val due = System.currentTimeMillis() - lastReadMs >= LIVE_READ_INTERVAL_MS
-                    if ((refreshNow || due) && ForegroundGate.readsAllowed()) {
+                    // NO timed polling. Reading LED/GPS/mode puts frames on 40007, and
+                    // measured on hardware that traffic competes with an FCC apply badly
+                    // enough to cost it frames. The state is now read only when something
+                    // actually asks: opening the screen, a write, or an aircraft change
+                    // (refreshNow). Manual by request — see doc/fcc-autoapply-tests.md.
+                    if (refreshNow && ForegroundGate.readsAllowed()) {
                         refreshNow = false
                         lastReadMs = System.currentTimeMillis()
                         runCatching { FlightState.refresh() }
@@ -1857,7 +1861,6 @@ class MainActivity : Activity() {
         private const val LEAVING_BLOCK_MS = 3_000L
         /** Cadence of the live status read (connect + LED/GPS/mode), ONLY while our app
          *  is in front (Fly backgrounded). One batched 40007 socket, strict abort. */
-        private const val LIVE_READ_INTERVAL_MS = 15_000L
         /** Coalesce typing in the params search box (see [paramRenderTick]). */
         private const val PARAM_SEARCH_DEBOUNCE_MS = 200L
     }

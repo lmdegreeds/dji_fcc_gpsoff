@@ -654,6 +654,19 @@ object DiagServer {
                 "/connect" -> "port=" + f.connect()
                 "/disconnect" -> { f.disconnect(); "main channel released (up only while capture or /connect holds it)" }
                 "/fcc" -> if (f.applyFcc()) "FCC sent — reboot to apply" else "port busy"
+                // Experiment harness: fire EXACTLY ONE apply, `sec` seconds after the
+                // next aircraft session appears on DJI Fly's screen, and nothing else.
+                //
+                // The normal keepalive sends five to seven bursts per link-up, so when
+                // FCC finally shows up in DJI Fly there is no way to tell which burst
+                // did it. Turn the keepalive off (/keepoff), arm this, power-cycle the
+                // drone, and the answer is unambiguous: one apply at a known offset.
+                "/applyat" -> {
+                    if (query(path, "cancel") == "1") { ApplyAt.cancel(); "armed apply cancelled" }
+                    else ApplyAt.arm(appCtx, scope, query(path, "sec")?.toLongOrNull() ?: 10L,
+                        query(path, "then")?.toLongOrNull() ?: 0L)
+                }
+                "/applyat/status" -> ApplyAt.status()
                 "/ce" -> "disabled: Restore CE was removed from this build (FCC-only)"
                 "/keepon" -> {
                     val mode = KeepaliveMode.of(query(path, "mode") ?: AppState.keepaliveMode.wire)
@@ -831,7 +844,7 @@ object DiagServer {
                     val ms = (query(path, "ms")?.toIntOrNull() ?: 1000).coerceIn(0, MAX_WINDOW_MS)
                     probe(port, DumlWire.hex(hex), ms)
                 }
-                "/help" -> "endpoints: /version /log /logjson /stats /ports /connect /disconnect /fcc " +
+                "/help" -> "endpoints: /version /log /logjson /stats /applyat?sec=&then=&cancel=1 /applyat/status /ports /connect /disconnect /fcc " +
                         "/foreground /identity /identity/forget /model /rc /screen /a11y " +
                         "/keepon?mode=home_point|periodic /keepoff /overlayon /overlayoff " +
                         "/profile?lito=1|0 /setauto?ka=&ov=&diag= /appstate /state /homepoint /radiolink /radiolink/reset /link /dronelink /country " +

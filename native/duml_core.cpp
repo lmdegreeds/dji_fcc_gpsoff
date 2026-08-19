@@ -129,6 +129,11 @@ const std::vector<int> Transport::kScanPorts = {40009, 40008, 8901, 8902, 8903, 
 // delivered again rather than suppressed for the life of the process.
 static constexpr uint64_t kDedupWindowMs = 2000;
 
+// How many times send_many may re-open the socket inside one batch before giving
+// up. Generous: one profile is 21 frames, and under contention the broker can
+// close after almost every one, so this has to allow a per-frame reconnect.
+static constexpr int kSendManyMaxReconnects = 64;
+
 static uint64_t now_ms() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -624,12 +629,28 @@ int Transport::send_many(int port, const std::vector<Bytes>& frames, int gap_ms)
     int fd = connect_loopback(port);
     if (fd < 0) return -1;
     int written = 0;
-    for (size_t i = 0; i < frames.size(); ++i) {
-        if (!send_all(fd, frames[i].data(), frames[i].size())) break;
-        ++written;
-        if (gap_ms > 0 && i + 1 < frames.size()) usleep((useconds_t)gap_ms * 1000);
+    int reconnects = 0;
+    for (size_t i = 0; i < frames.size(); ) {
+        if (send_all(fd, frames[i].data(), frames[i].size())) {
+            ++written; ++i;
+            if (gap_ms > 0 && i < frames.size()) usleep((useconds_t)gap_ms * 1000);
+            continue;
+        }
+        // The broker closed this socket mid-profile. Measured on RC 2: with another
+        // reader holding 40007 (a capture, or the UI's parameter poll) a 40009 socket
+        // survives only one or two writes, and a plain give-up delivered 1 of 21
+        // frames while still reporting the write path as healthy. Reconnect and carry
+        // on from the frame that failed — the point of one socket is FEWER connects,
+        // not fewer frames, so under contention it must degrade to the old behavior
+        // rather than silently drop the profile.
+        ::shutdown(fd, SHUT_RDWR); ::close(fd);
+        if (++reconnects > kSendManyMaxReconnects) return written;
+        fd = connect_loopback(port);
+        if (fd < 0) return written;
     }
     ::shutdown(fd, SHUT_RDWR); ::close(fd);
+    if (reconnects > 0)
+        LOGI("send_many: %d frames on port %d needed %d reconnect(s)", written, port, reconnects);
     return written;
 }
 

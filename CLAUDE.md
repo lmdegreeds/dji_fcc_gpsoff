@@ -35,3 +35,16 @@ Before drawing any conclusion from a live log, confirm the running build first:
     curl -s http://<rc>:8899/version
 
 Only then interpret the log.
+
+## Date every documentation change
+
+Any new or edited section under `doc/` carries the date it was written, in the
+heading or the first line: `## Что-то (2026-08-19)` or `**Замерено 2026-08-19.**`
+
+Hardware findings age. A measurement is tied to a firmware version, a build and a
+controller state, and six months later the only way to judge whether a claim still
+holds is to know when it was made. An undated finding is indistinguishable from a
+current one, and this project's docs are almost entirely findings.
+
+The same applies to a correction: when a claim is retracted, date the retraction
+too, so the reader can see which of two contradicting statements is the later one.
