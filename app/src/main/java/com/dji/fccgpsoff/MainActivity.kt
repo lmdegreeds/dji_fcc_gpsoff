@@ -82,7 +82,9 @@ class MainActivity : Activity() {
     @Volatile private var flyStat = "?"
     /** Set on foreground entry / aircraft change to force one immediate live-state
      *  read; between those the loop throttles 40007 reads (see [READ_INTERVAL_MS]). */
-    @Volatile private var refreshNow = true
+    /** Set only by an explicit request — the read button, or a write that changed
+     *  something. NOT by onResume: see the note there. */
+    @Volatile private var refreshNow = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         requestWindowFeature(Window.FEATURE_NO_TITLE)
@@ -1345,19 +1347,29 @@ class MainActivity : Activity() {
     private fun startLoops() {
         loopJob?.cancel()
         loopJob = scope.launch {
-            StartupProbe.run(applicationContext)
+            // NO probe here. StartupProbe opens ~15 sockets on 40007 (serial 00:51,
+            // up to 6 name-variant windows, then three param reads), and it used to run
+            // as the first statement of this coroutine — before the `foreground` check,
+            // before the read gate, on every Activity creation including a recreate from
+            // the language toggle. Measured 2026-08-19: entering this app and going back
+            // to DJI Fly loses FCC, while merely minimising Fly does not. That burst is
+            // the difference. The probe now runs only where it is worth its cost: the
+            // setup wizard, the "опрос" button, and /profile/detect.
             var lastEpoch = AircraftSession.epoch
             var lastReadMs = 0L
             runOnUiThread { runCatching { renderDevice(); renderState() } }
             while (isActive) {
                 if (foreground) {
-                    // A serial change (different aircraft) bumps the session epoch —
-                    // re-probe so the new drone's variant/model replace the old, and
-                    // force one fresh live-state read.
+                    // A serial change (different aircraft) bumps the session epoch. The
+                    // cached per-drone state is already cleared by AircraftSession; what
+                    // is NOT done here any more is re-probing, because that is the same
+                    // 40007 burst as above and an aircraft change is exactly when DJI Fly
+                    // is busy establishing its link. The panel shows what is known and the
+                    // "опрос" button re-probes when the user wants it.
                     if (AircraftSession.epoch != lastEpoch) {
                         lastEpoch = AircraftSession.epoch
-                        StartupProbe.run(applicationContext)
-                        refreshNow = true
+                        DiagLog.info("aircraft changed — not re-probing (40007 stays quiet); " +
+                                     "use the probe button to refresh")
                     }
                     // The ONLY reliable "drone connected" signal is a flight-controller
                     // read answering (40009 is identical drone on/off — proven live).
@@ -1599,7 +1611,11 @@ class MainActivity : Activity() {
     // ---------- lifecycle / permissions ----------
     override fun onNewIntent(intent: Intent?) { super.onNewIntent(intent); setIntent(intent); handleIntent(intent) }
     override fun onResume() {
-        super.onResume(); foreground = true; refreshNow = true; syncSwitches()
+        // No refreshNow here. Coming back to this screen used to force a live-state read
+        // on 40007 — the port DJI Fly mirrors video on — which is half of why switching
+        // between the two apps costs FCC (2026-08-19). State is read when asked for: the
+        // "Прочитать состояние" button, or after a write.
+        super.onResume(); foreground = true; syncSwitches()
     }
     /**
      * Leaving this screen stops 40007 reads **immediately**, whatever we are leaving for.

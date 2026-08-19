@@ -23,6 +23,10 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 
 /**
  * First-run setup wizard, bilingual (RU/EN, seeded from the device locale and
@@ -413,6 +417,18 @@ class SetupWizardActivity : Activity() {
     // ------------------------------------------------------------------- done
 
     private fun finishWizard() {
+        // The ONE place that still probes the aircraft by itself. StartupProbe opens ~15
+        // sockets on 40007 (serial, name-variant, live state) and was removed from every
+        // automatic path on 2026-08-19 because that burst costs FCC whenever the user
+        // switches between this app and DJI Fly. Here it is worth it and safe: setup runs
+        // once, with the wizard in front and DJI Fly not in use, and the app needs the
+        // name-variant before any parameter write can be correct.
+        // Deliberately NOT tied to this Activity's life: the wizard finishes by launching
+        // MainActivity and closing, and cancelling the probe half-way would leave the
+        // name-variant undetected with nothing left to detect it.
+        CoroutineScope(SupervisorJob() + Dispatchers.Default).launch {
+            runCatching { StartupProbe.run(applicationContext) }
+        }
         AppState.setAutoKeepalive(this, autoKeep)
         AppState.setAutoOverlay(this, autoOverlay)
         AppState.setAutoDiag(this, autoDiag)
