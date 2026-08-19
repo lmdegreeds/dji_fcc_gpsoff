@@ -48,3 +48,20 @@ current one, and this project's docs are almost entirely findings.
 
 The same applies to a correction: when a claim is retracted, date the retraction
 too, so the reader can see which of two contradicting statements is the later one.
+
+## Пока идёт разработка — коммить только в `dev` (2026-08-19)
+
+Все изменения идут в ветку `dev`. В `main` ничего не коммитить и не сливать
+самостоятельно — слияние и выпуск релиза делаются **только по явной команде
+пользователя**.
+
+Причина: на пульте стоит рабочая сборка, которой пользуются, и ветка `main`
+должна оставаться тем, к чему можно откатиться в любой момент. Сборки для
+проверки на железе собираются из `dev` и ставятся обновлением поверх.
+
+Если работа начата не в `dev` — переключиться на неё до первого коммита:
+
+    git checkout dev        # или: git checkout -b dev
+
+Правило про номер сборки при этом никуда не девается: `versionCode` и
+`versionName` поднимаются на каждой сборке, включая сборки из `dev`.
