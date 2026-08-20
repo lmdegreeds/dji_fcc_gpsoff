@@ -73,28 +73,17 @@ object ParamRead {
     }
 
     /**
-     * Walk a 40007 window for a 03:F8 response whose echoed hash matches ANY of
-     * [hashes] — the FC (and DJI Fly) poll many params, so the hash MUST match or we
-     * would return some other parameter's value. Returns the index of the hash that
-     * answered and the RAW payload of that reply.
-     *
-     * Several hashes because one logical parameter can have several spellings and
-     * therefore several addresses ([ParamName]); asking for all of them in the SAME
-     * window is what makes resolving a joined `a|b` name cost no extra window.
+     * Walk a 40007 window for the 03:F8 response whose echoed hash matches [hash] — the FC
+     * (and DJI Fly) poll many params, so the hash MUST match or we would return some other
+     * parameter's value. Returns the RAW payload of our reply.
      */
-    private fun extractAny(stream: ByteArray, hashes: List<ByteArray>, len: Int = stream.size): Pair<Int, ByteArray>? =
+    private fun extract(stream: ByteArray, hash: ByteArray, len: Int = stream.size): ByteArray? =
         WrappedFrames.walk(stream, len) { fr ->
             if (fr.cmdSet == DumlWire.CMDSET_FLYC && fr.cmdId == DumlWire.CMDID_READ_PARAM_HASH && fr.isResponse) {
                 val pl = fr.payload
-                if (pl.size < 5 || pl[0].toInt() != 0) null
-                else {
-                    var hit: Pair<Int, ByteArray>? = null
-                    for (i in hashes.indices) {
-                        val h = hashes[i]
-                        if (pl[1] == h[0] && pl[2] == h[1] && pl[3] == h[2] && pl[4] == h[3]) { hit = i to pl; break }
-                    }
-                    hit
-                }
+                if (pl.size >= 5 && pl[0].toInt() == 0 &&
+                    pl[1] == hash[0] && pl[2] == hash[1] && pl[3] == hash[2] && pl[4] == hash[3]
+                ) pl else null
             } else null
         }
 
@@ -119,23 +108,29 @@ object ParamRead {
      * which was quadratic and could burn the window on its own while DJI Fly's
      * video mirror was pushing bytes.
      */
-    private fun probeOnce(names: List<String>, hashes: List<ByteArray>, windowMs: Int): Pair<Int, ByteArray>? {
-        val wires = hashes.map { request(it) }
-        for (i in names.indices) DiagLog.tx(DumlWire.PORT_LED, "read ${ParamName.tag(names[i])} 03:F8", wires[i])
+    /** Why the last window stopped — for the "no answer" line. A window the peer closed
+     *  after 40 ms and a window that ran its full 500 ms in silence look identical in a
+     *  log otherwise, and they are different faults (2026-08-20). */
+    @Volatile private var lastWindowEnd = "elapsed"
+
+    private fun probeOnce(name: String, hash: ByteArray, windowMs: Int): ByteArray? {
+        val wire = request(hash)
+        DiagLog.tx(DumlWire.PORT_LED, "read ${ParamName.tag(name)} 03:F8", wire)
         return try {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, DumlWire.PORT_LED), 400)
                 s.soTimeout = SOCKET_POLL_MS
                 val out = s.getOutputStream()
-                for (w in wires) out.write(w)
-                out.flush()
+                out.write(wire); out.flush()
                 val ins = s.getInputStream()
                 val end = System.currentTimeMillis() + windowMs
                 var buf = ByteArray(16 * 1024)
                 var used = 0
                 var scanned = 0
+                lastWindowEnd = "elapsed"
                 while (System.currentTimeMillis() < end) {
-                    if (!ForegroundGate.readsAllowed()) break   // strict: stop mid-window if DJI Fly takes the front
+                    // strict: stop mid-window if DJI Fly takes the front
+                    if (!ForegroundGate.readsAllowed()) { lastWindowEnd = "read gate shut mid-window"; break }
                     if (used == buf.size) {
                         if (buf.size >= MAX_SCAN_BYTES) {
                             System.arraycopy(buf, used - MAX_WRAPPED, buf, 0, MAX_WRAPPED)
@@ -145,20 +140,21 @@ object ParamRead {
                     val r = try { ins.read(buf, used, buf.size - used) }
                         catch (e: java.net.SocketTimeoutException) { 0 }   // quiet, not closed
                         catch (e: Exception) { -1 }
-                    if (r < 0) break                                       // peer closed: nothing more is coming
+                    // peer closed: nothing more is coming
+                    if (r < 0) { lastWindowEnd = "the port closed on us after ${System.currentTimeMillis() - (end - windowMs)} ms"; break }
                     if (r > 0) {
                         used += r
                         // Re-scan from a frame's worth before the last scan so a reply
                         // split across two chunks is still found.
                         val from = maxOf(0, scanned - MAX_WRAPPED)
-                        extractAny(buf.copyOfRange(from, used), hashes)?.let { return it }
+                        extract(buf.copyOfRange(from, used), hash)?.let { return it }
                         scanned = used
                     }
                     // r == 0 → quiet poll tick; keep walking the window, do not resend.
                 }
                 null
             }
-        } catch (e: Exception) { DiagLog.err("param read ${names.firstOrNull()}: ${e.message}"); null }
+        } catch (e: Exception) { DiagLog.err("param read $name: ${e.message}"); null }
     }
 
     /**
@@ -167,17 +163,33 @@ object ParamRead {
      * Re-checks the foreground gate before EACH attempt, so a switch to DJI Fly stops
      * the retry burst at once instead of finishing all attempts on its video port.
      *
-     * A name with several spellings ([ParamName]) puts every candidate address into the
-     * SAME window — the wire loses whole windows, not individual requests, so N asks cost
-     * one window — and whichever answers both returns the value and settles the address
-     * for the rest of the session ([ParamAlias]). A plain name has one candidate and this
-     * is byte-for-byte what it always was.
+     * **ONE request per window. Measured on hardware 2026-08-20** (Lito X1 over RC 2,
+     * app 1.1.2): putting a parameter's three candidate spellings into a single `03:F8`
+     * window returned NOTHING, 16 windows out of 16 — including `forearm_led_ctrl`, whose
+     * hash answered in 25 ms when it was the only ask in the window. Single-ask windows in
+     * the same session answered 12 of 17, the documented ~70%. `DumlWindow.collect`'s
+     * measured batching does not transfer here: it holds a 1500 ms window and RE-SENDS
+     * every unanswered ask each 250 ms, while this path deliberately sends once into 500 ms
+     * and never re-sends, because a socket that keeps writing on DJI Fly's video port
+     * across an app switch is the thing that costs the user their link.
+     *
+     * A name with several spellings is therefore settled FIRST, by `03:F7` through
+     * [ParamAlias] — that route does batch correctly, its negative is real, and it is
+     * exactly what makes the "Re-probe" button work. Only if that cannot settle it do the
+     * spellings get one window EACH across the retry budget, rather than one spelling
+     * getting all of them.
      *
      * Every outcome is logged, because until 2026-08-20 an answered read and an unanswered
      * one looked identical in a shared log: only the TX went in, and telling them apart
      * meant counting retry lines and measuring the gaps between them.
      */
     suspend fun readRaw(name: String, attempts: Int = DEFAULT_ATTEMPTS): ByteArray? = withContext(Dispatchers.IO) {
+        // Settle the spelling on the route that can settle it, before spending read windows
+        // guessing. Opens nothing for a plain name, for an already-measured one, or with the
+        // read gate shut.
+        // Two attempts, not three: this runs in front of a value the user is waiting for,
+        // and a third 1500 ms window buys little once two have gone unanswered.
+        if (ParamAlias.known(name) == null && ParamName.isJoined(name)) ParamAlias.resolve(name, attempts = 2)
         val cands = ParamAlias.known(name)?.let { listOf(it) } ?: ParamAlias.order(name)
         val hashes = cands.map { DumlNative.nativeParamHash(it) }
         val t0 = System.currentTimeMillis()
@@ -196,10 +208,12 @@ object ParamRead {
                         (ForegroundGate.blockReason() ?: "read gate closed"))
                 return@withContext null
             }
+            // One spelling per window, rotating — so an unresolved name spends its retry
+            // budget covering its candidates instead of hammering one guess three times.
+            val idx = tried % cands.size
             tried++
-            val hit = probeOnce(cands, hashes, READ_WINDOW_MS)
-            if (hit != null) {
-                val (idx, pl) = hit
+            val pl = probeOnce(cands[idx], hashes[idx], READ_WINDOW_MS)
+            if (pl != null) {
                 ReadStats.answered()
                 if (cands.size > 1) ParamAlias.note(name, cands[idx])
                 val v = parseValue(pl)
@@ -215,8 +229,8 @@ object ParamRead {
             delay(80)
         }
         DiagLog.info("read ${ParamName.tag(cands[0])} — NO ANSWER" +
-            (if (cands.size > 1) " on any of ${cands.size} spelling(s)" else "") +
-            " · $tried attempt(s) · ${System.currentTimeMillis() - t0} ms " +
+            (if (cands.size > 1) " on any of ${cands.size} spelling(s), one window each" else "") +
+            " · $tried attempt(s) · ${System.currentTimeMillis() - t0} ms · last window: $lastWindowEnd " +
             "(silence on this bus is 'no route back', not 'absent' — use 03:F7 to tell them apart)")
         null
     }

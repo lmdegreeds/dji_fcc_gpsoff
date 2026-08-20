@@ -36,6 +36,13 @@ object ParamAlias {
      *  hopeless name is not re-asked on every row render; a real absence does not change
      *  while the same aircraft is connected. */
     private val denied = ConcurrentHashMap<String, Long>()
+    /** asked name → when a resolution last found nothing at all. Unlike a denial this is
+     *  not evidence, so it expires: the aircraft may simply have been off. Without it every
+     *  read of an unresolved name would re-spend the whole 03:F7 budget first. */
+    private val unreachable = ConcurrentHashMap<String, Long>()
+
+    /** How long to wait before asking again after a resolution that nothing answered. */
+    private const val RETRY_AFTER_SILENCE_MS = 30_000L
 
     /**
      * Which candidate position has been winning on this aircraft: 0 = the joined form
@@ -49,7 +56,7 @@ object ParamAlias {
 
     fun clear() {
         val n = resolved.size
-        resolved.clear(); denied.clear(); preferred = -1
+        resolved.clear(); denied.clear(); unreachable.clear(); preferred = -1
         if (n > 0) DiagLog.info("param alias map cleared ($n resolved name(s))")
     }
 
@@ -115,7 +122,7 @@ object ParamAlias {
      * the name as given and says so in the log, so a shared log never leaves a caller
      * guessing which address a frame carried.
      */
-    suspend fun resolve(name: String): String {
+    suspend fun resolve(name: String, attempts: Int = ParamMeta.DEFAULT_ATTEMPTS): String {
         if (name.isEmpty()) return name
         resolved[name]?.let { return it }
         val cands = ParamName.candidates(name)
@@ -125,13 +132,18 @@ object ParamAlias {
         // for a write from the floating panel. Return quietly rather than reporting a
         // failure to learn something we never tried to learn.
         if (!ForegroundGate.readsAllowed()) return name
-        val r = ParamMeta.resolve(order(name))
+        // Do not re-spend the whole 03:F7 budget in front of every single read while the
+        // aircraft is off. A silence is not a fact, so this expires rather than sticking.
+        unreachable[name]?.let { if (System.currentTimeMillis() - it < RETRY_AFTER_SILENCE_MS) return name }
+        val r = ParamMeta.resolve(order(name), attempts)
         return when {
-            r.name != null -> { note(name, r.name); r.name }
-            r.allAbsent -> { noteDenied(name); name }
+            r.name != null -> { unreachable.remove(name); note(name, r.name); r.name }
+            r.allAbsent -> { unreachable.remove(name); noteDenied(name); name }
             else -> {
+                unreachable[name] = System.currentTimeMillis()
                 DiagLog.warn("param name: '${name}' unresolved — no spelling answered 03:F7 " +
-                    "(${r.silent.size} silent, ${r.absent.size} denied); addressing it as the board spells it")
+                    "(${r.silent.size} silent, ${r.absent.size} denied); reading each spelling in " +
+                    "its own window instead, and not re-asking for ${RETRY_AFTER_SILENCE_MS / 1000}s")
                 name
             }
         }

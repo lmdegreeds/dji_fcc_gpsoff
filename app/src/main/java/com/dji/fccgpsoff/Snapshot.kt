@@ -61,9 +61,13 @@ object Snapshot {
         return listOf(
             "build" to "${AppVersion.of(ctx)}/$tag",
             "device" to "${Build.MODEL}/${Build.VERSION.SDK_INT}/${Locale.getDefault()}/${AppState.uiRu}",
+            // Enabled and bound only. Which app is in front — and therefore whether reads
+            // are allowed right this second — changes every time the user switches apps,
+            // and a full 16-line block per switch buried the rest of the log: five blocks
+            // were 43% of one session's events. ForegroundGate already logs each switch as
+            // a single line, which is the right size for a momentary fact (2026-08-20).
             "accessibility" to (isAccessibilityEnabled(ctx).toString() + "/" +
-                ForegroundGate.accessibilityConnected + "/" + ForegroundGate.foregroundPackage + "/" +
-                ForegroundGate.readsAllowed()),
+                ForegroundGate.accessibilityConnected),
             "grants" to grantsFingerprint(ctx),
             "services" to (FccKeepaliveService.running.toString() + AppState.autoKeepalive +
                 OverlayService.running + AppState.autoOverlay + DiagServer.isRunning + AppState.autoDiag +

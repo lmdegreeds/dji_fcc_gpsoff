@@ -1788,22 +1788,31 @@ class MainActivity : Activity() {
         stateReadJob = scope.launch {
             var gateClosed = false
             var rounds = 0
+            // What THIS press still owes. Deliberately not FlightState.missing(): that is
+            // "has never been read", so once all three held a value the loop condition was
+            // false on entry and the button did nothing at all while reporting success —
+            // exactly what a user saw as "after Re-probe, Read state does nothing"
+            // (2026-08-20). A button called "Read state" reads the state.
+            var owed = FlightState.Item.values().toList()
             try {
-                while (isActive && rounds < STATE_READ_ROUNDS && FlightState.missing().isNotEmpty()) {
+                while (isActive && rounds < STATE_READ_ROUNDS && owed.isNotEmpty()) {
                     rounds++
-                    for (item in FlightState.missing()) {
+                    val stillOwed = ArrayList<FlightState.Item>(owed.size)
+                    for (item in owed) {
                         if (!ForegroundGate.readsAllowed()) { gateClosed = true; break }
                         val got = runCatching { FlightState.refreshOne(item) }.getOrDefault(false)
+                        if (!got) stillOwed.add(item)
                         runOnUiThread { runCatching { renderState(); renderDevice() } }
                         if (!got) setStatus(t("↻ ${item.label}: нет ответа, повторяю…",
                                               "↻ ${item.label}: no answer, retrying…"))
                     }
                     if (gateClosed) break
-                    if (FlightState.missing().isNotEmpty()) delay(STATE_READ_GAP_MS)
+                    owed = stillOwed
+                    if (owed.isNotEmpty()) delay(STATE_READ_GAP_MS)
                 }
             } finally {
                 stateReading = false
-                val left = FlightState.missing()
+                val left = owed
                 // Every value asked for, none answered, and the gate stayed open the
                 // whole time: that IS the "no drone on the link" verdict, so record it
                 // rather than leave the panel implying it was never asked.
@@ -1939,7 +1948,7 @@ class MainActivity : Activity() {
         // "reading…" with nothing reading behind it (fixed 2026-08-19).
         val left = FlightState.missing().size
         stateNote.text = when {
-            stateReading -> t("читаю… осталось $left из 3", "reading… $left of 3 left")
+            stateReading -> t("читаю…", "reading…")
             !ForegroundGate.readsAllowed() -> t("DJI Fly впереди — чтение приостановлено (переключитесь в это приложение)",
                                                 "DJI Fly is active — reads paused (switch to this app to read state)")
             FlightState.connected == true && left == 0 ->
