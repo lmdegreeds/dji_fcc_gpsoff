@@ -53,7 +53,11 @@ class SetupWizardActivity : Activity() {
     private val GREEN = 0xFF22C993.toInt(); private val BLUE = 0xFF4C6FFF.toInt()
     private val SLATE = 0xFF2A3042.toInt(); private val AMBER = 0xFFF5A623.toInt()
 
-    private enum class Step { WELCOME, A11Y, INSTALL, FILES, PROFILE, SERVICES }
+    // BATTERY sits next to A11Y because they fail the same way: both are settings the app
+ //   cannot grant itself, both are silent when missing, and both stop the app doing the one
+ //   thing it exists for. Added 2026-08-20 after a controller was found running the
+ //   keepalive with optimisation on.
+    private enum class Step { WELCOME, A11Y, BATTERY, INSTALL, FILES, PROFILE, SERVICES }
 
     private var step = Step.WELCOME
 
@@ -153,6 +157,7 @@ class SetupWizardActivity : Activity() {
         when (step) {
             Step.WELCOME -> welcome()
             Step.A11Y -> a11y()
+            Step.BATTERY -> battery()
             Step.INSTALL -> install()
             Step.FILES -> files()
             Step.PROFILE -> profile()
@@ -197,6 +202,50 @@ class SetupWizardActivity : Activity() {
                "floating menu and all parameter writes are unaffected."))
         act(t("Открыть настройки", "Open settings")) {
             open(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        footerBtns(back = true, skip = !on)
+    }
+
+    /**
+     * The battery-optimisation exemption.
+     *
+     * Marked "recommended", not "optional": the app's main job is re-applying FCC while the
+     * controller sits idle, and an optimised app is frozen exactly then. The failure is
+     * completely silent — a frozen process cannot log the fact that it was frozen — so the
+     * only symptom is FCC quietly reverting and a gap in the log.
+     */
+    private fun battery() {
+        val on = Grants.batteryUnrestricted(this)
+        head(t("Работа в фоне (батарея)", "Running in the background (battery)"),
+             t("рекомендуется", "recommended"))
+        status(on, t("ограничений нет", "not restricted"), t("Android может замораживать приложение",
+                                                            "Android may freeze the app"))
+        para(t("Зачем: авто-FCC живёт фоновой службой и переприменяет режим, пока пульт лежит с потухшим экраном. " +
+               "Уведомления о службе для Android мало: при включённой оптимизации батареи он всё равно " +
+               "замораживает процесс, FCC перестаёт переприменяться, и сказать об этом некому — замороженный " +
+               "процесс не может даже записать строчку в лог. Видно только по провалу во времени.",
+               "Why: auto-FCC lives in a foreground service and re-applies the mode while the controller lies idle " +
+               "with its screen off. A service notification is not enough for Android: with battery optimisation on " +
+               "it freezes the process anyway, FCC stops being re-applied, and nothing reports it — a frozen process " +
+               "cannot even write a log line. The only trace is a gap in the timestamps."))
+        steps(t("Что нажать на открывшемся экране:", "What to tap on the screen that opens:"),
+            t("Если появился вопрос «Разрешить работу в фоне?» — нажмите «Разрешить»",
+              "If a dialog asks \"Allow app to always run in the background?\" — tap Allow"),
+            t("Если открылся список «Оптимизация батареи» — выберите DJI_FCC_GPSOFF и «Не оптимизировать»",
+              "If a \"Battery optimisation\" list opened — pick DJI_FCC_GPSOFF and \"Don't optimise\""),
+            t("Если открылся экран приложения — «Батарея» → «Без ограничений»",
+              "If the app's own page opened — Battery → Unrestricted"),
+            t("Вернитесь назад — сюда", "Come back here"))
+        note(t("Разрешение касается только этого приложения и ни на что, кроме фоновой работы, не влияет. " +
+               "Отозвать его можно там же в любой момент.",
+               "The exemption covers this app only and changes nothing except its ability to run in the background. " +
+               "It can be revoked in the same place at any time."))
+        act(t("Разрешить работу в фоне", "Allow background running")) {
+            // Three screens, best first: the one-tap dialog, the optimisation list, this
+            // app's settings page. Vendor ROMs hide different ones, so try until one opens.
+            if (!Grants.openBatterySettings(this))
+                toast(t("Это устройство не открывает ни один из экранов оптимизации батареи",
+                        "This device offers none of the battery-optimisation screens"))
         }
         footerBtns(back = true, skip = !on)
     }
@@ -600,6 +649,8 @@ class SetupWizardActivity : Activity() {
         // The wizard asked about accessibility properly; don't let MainActivity's
         // one-line fallback dialog ask again on the very next screen.
         AppState.setA11yPrompted(this, true)
+        // The wizard has a page for this now, so MainActivity must not ask a second time.
+        AppState.setBatteryPrompted(this, true)
         AppState.setWizardDone(this, true)
         AppState.setWizardStep(this, 0)   // a later re-run from the ⋮ menu starts at the top
 

@@ -76,6 +76,7 @@ class FccKeepaliveService : Service() {
         activeMode = mode
         DiagLog.info("keepalive: mode = ${mode.label}")
         warnIfBlind()
+        warnIfOptimised()
         loop = scope.launch {
             if (awaitProxy() <= 0) return@launch              // cancelled while waiting
             // Feed DroneLink from 40007 while Fly isn't foreground. Started on the
@@ -99,6 +100,24 @@ class FccKeepaliveService : Service() {
      * That cost nine consecutive test applies before anyone thought to check the one
      * status field that showed it — a field nobody reads while the app looks healthy.
      */
+    /**
+     * Say so when the OS is allowed to freeze us.
+     *
+     * Same shape and same reason as [warnIfBlind]: the failure is silent and looks like the
+     * app simply stopped working. A frozen process cannot write "I was frozen", so the
+     * warning has to go in while it still can, and the gap in the log afterwards is then
+     * interpretable (2026-08-20).
+     */
+    private fun warnIfOptimised() {
+        if (Grants.batteryUnrestricted(this)) return
+        DiagLog.warn(
+            "keepalive: BATTERY OPTIMISATION IS ON for this app — Android may freeze the process " +
+            "while the controller is idle with the screen off, and FCC then stops being re-applied " +
+            "with nothing in the log to say why (a frozen process cannot write one). Grant the " +
+            "exemption from the setup wizard, or in Android settings → Battery."
+        )
+    }
+
     private fun warnIfBlind() {
         // One implementation of this query, in [Snapshot] — it existed here and in two
         // Activities with two different comparison strategies (2026-08-20).

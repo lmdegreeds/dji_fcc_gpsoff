@@ -22,6 +22,10 @@ object AppState {
     @Volatile var autoOverlay = true
     /** True once we've shown the first-launch accessibility prompt (reset on reinstall). */
     @Volatile var a11yPrompted = false
+    /** True once we've asked about the battery-optimisation exemption. Asked at most once
+     *  outside the wizard: it is a recommendation, not a requirement, and an app that keeps
+     *  re-opening a system settings screen is an app people stop reading. */
+    @Volatile var batteryPrompted = false
     /** True once the setup wizard has been completed (or explicitly skipped through).
      *  While false, [MainActivity] routes straight to [SetupWizardActivity]. */
     @Volatile var wizardDone = false
@@ -66,6 +70,7 @@ object AppState {
         autoDiag = p.getBoolean("auto_diag", false)
         autoOverlay = p.getBoolean("auto_overlay", true)
         a11yPrompted = p.getBoolean("a11y_prompted", false)
+        batteryPrompted = p.getBoolean("battery_prompted", false)
         wizardDone = p.getBoolean("wizard_done", false)
         // Default to the device locale, not to a fixed choice; migrate the older
         // wizard-only key, so a build installed before the
@@ -100,6 +105,7 @@ object AppState {
     }
     fun setAutoDiag(ctx: Context, v: Boolean) { autoDiag = v; put(ctx, "auto_diag", v) }
     fun setA11yPrompted(ctx: Context, v: Boolean) { a11yPrompted = v; put(ctx, "a11y_prompted", v) }
+    fun setBatteryPrompted(ctx: Context, v: Boolean) { batteryPrompted = v; put(ctx, "battery_prompted", v) }
     fun setWizardDone(ctx: Context, v: Boolean) { wizardDone = v; put(ctx, "wizard_done", v) }
     fun setUiRu(ctx: Context, v: Boolean) { uiRu = v; put(ctx, "ui_ru", v) }
     fun setAutoUpdateCheck(ctx: Context, v: Boolean) { autoUpdateCheck = v; put(ctx, "auto_update_check", v) }

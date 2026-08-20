@@ -81,6 +81,7 @@ object Snapshot {
     }
 
     private fun grantsFingerprint(ctx: Context): String = listOf(
+        Grants.batteryUnrestricted(ctx),
         runCatching { Settings.canDrawOverlays(ctx) }.getOrDefault(false),
         runCatching {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) ctx.packageManager.canRequestPackageInstalls() else true
@@ -195,19 +196,9 @@ object Snapshot {
             (if (!enabled) " ← reads are refused until this is switched on" else "")
     }
 
-    /**
-     * The one copy of the "is our accessibility service enabled" query.
-     *
-     * It existed three times — in [MainActivity], [SetupWizardActivity] and
-     * [FccKeepaliveService] — with two different comparison strategies. Takes a plain
-     * Context, so a service or a snapshot can ask it too.
-     */
-    fun isAccessibilityEnabled(ctx: Context): Boolean = runCatching {
-        val want = android.content.ComponentName(ctx, DjiFlyAccessibilityService::class.java).flattenToString()
-        val flat = Settings.Secure.getString(ctx.contentResolver,
-            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
-        flat.split(':').any { it.equals(want, ignoreCase = true) }
-    }.getOrDefault(false)
+    /** Kept as a name the rest of the app already calls; the query itself lives in
+     *  [Grants], with the other grant queries. */
+    fun isAccessibilityEnabled(ctx: Context): Boolean = Grants.accessibilityEnabled(ctx)
 
     private fun grantsLine(ctx: Context): String {
         val overlay = runCatching { Settings.canDrawOverlays(ctx) }.getOrDefault(false)
@@ -224,15 +215,13 @@ object Snapshot {
                     else android.Manifest.permission.READ_EXTERNAL_STORAGE
             ctx.checkSelfPermission(p) == PackageManager.PERMISSION_GRANTED
         }.getOrDefault(false)
-        // Not requested by this app, but decisive for "the keepalive died overnight":
-        // without the exemption the OS may freeze the process regardless of the
-        // foreground service.
-        val battery = runCatching {
-            (ctx.getSystemService(Context.POWER_SERVICE) as PowerManager)
-                .isIgnoringBatteryOptimizations(ctx.packageName)
-        }.getOrNull()
+        // Decisive for "the keepalive died overnight": without the exemption the OS may
+        // freeze the process regardless of the foreground service, and a frozen process
+        // cannot log the fact.
+        val battery = Grants.batteryUnrestricted(ctx)
         return "overlay=${yn(overlay)} · install-apps=${yn(install)} · notifications=${yn(notif)} · " +
-            "media=${yn(media)} · battery-unrestricted=" + (battery?.let { yn(it) } ?: "?") +
+            "media=${yn(media)} · battery-unrestricted=${yn(battery)}" +
+            (if (!battery) " ← the OS may freeze this app when the screen is off, and the keepalive with it" else "") +
             (if (!notif) " ← a foreground service without a notification is easy for the OS to kill" else "")
     }
 

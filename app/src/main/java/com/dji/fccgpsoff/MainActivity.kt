@@ -135,6 +135,7 @@ class MainActivity : Activity() {
         intent?.removeExtra(EXTRA_SKIP_AUTOSTART)
         handleIntent(intent)
         maybePromptAccessibility()
+        maybePromptBattery()
         maybeCheckUpdates()
         showLastCrash()
         setStatus(t("Готово · FCC постоянный · применяется сразу · состояние читается, пока это окно впереди",
@@ -744,9 +745,55 @@ class MainActivity : Activity() {
             cell(if (AppState.uiRu) "Русский" else "English",
                  smallBtn(t("Switch to English", "Переключить на русский"), BLUE) { toggleLanguage() }))
 
+        // A permanent home for the battery exemption, not only the wizard page: Android can
+        // revoke it, and an install made before that page existed would never see it. The
+        // row states the CURRENT grant, re-read on every render of this screen.
+        val batteryCard = card(t("🔋 Работа в фоне", "🔋 Running in the background"), batteryBody())
+
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(10), dp(12), dp(4)) }
-        col.addView(profileCard); col.addView(regionCard); col.addView(updateCard); col.addView(langCard)
+        col.addView(profileCard); col.addView(regionCard); col.addView(batteryCard)
+        col.addView(updateCard); col.addView(langCard)
         return ScrollView(this).apply { addView(col); isFillViewport = true }
+    }
+
+    /**
+     * The battery-optimisation row.
+     *
+     * Says what the state IS rather than offering a switch, because this is not ours to
+     * set: only the user can grant it, on a system screen. The button opens the best screen
+     * this ROM will show ([Grants.openBatterySettings]).
+     */
+    private fun batteryBody(): LinearLayout {
+        val body = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        val ok = Grants.batteryUnrestricted(this)
+        body.addView(TextView(this).apply {
+            text = if (ok) t("✅ ограничений нет — приложение может работать с потухшим экраном",
+                             "✅ unrestricted — the app may run with the screen off")
+                   else t("⚠ Android может замораживать приложение, когда экран потухнет",
+                          "⚠ Android may freeze this app once the screen goes off")
+            setTextColor(if (ok) GREEN else AMBER); textSize = 12f
+        })
+        body.addView(TextView(this).apply {
+            text = t("Авто-FCC переприменяет режим, пока пульт лежит без дела. Уведомления фоновой службы " +
+                     "для этого мало: при включённой оптимизации Android замораживает процесс, FCC перестаёт " +
+                     "переприменяться, и в логе об этом ничего не будет — замороженный процесс не может " +
+                     "записать даже строку. Видно только по провалу во времени.",
+                     "Auto-FCC re-applies the mode while the controller lies idle. A foreground-service " +
+                     "notification is not enough: with optimisation on, Android freezes the process, FCC stops " +
+                     "being re-applied, and the log says nothing — a frozen process cannot write a line. The only " +
+                     "trace is a gap in the timestamps.")
+            setTextColor(MUTED); textSize = 10.5f; setLineSpacing(dp(2).toFloat(), 1f); setPadding(0, dp(6), 0, 0)
+        })
+        body.addView(rowc(smallBtn(
+            if (ok) t("Открыть настройки батареи", "Open battery settings")
+            else t("Разрешить работу в фоне", "Allow background running"),
+            if (ok) SLATE else GREEN
+        ) {
+            if (!Grants.openBatterySettings(this))
+                setStatus(t("⚠ это устройство не открывает экраны оптимизации батареи",
+                            "⚠ this device offers no battery-optimisation screen"))
+        }), rowLp())
+        return body
     }
 
     /** Pick the radio country every FCC command writes. The list is [FccRegion] —
@@ -2256,6 +2303,36 @@ class MainActivity : Activity() {
                           "Reads the drone's model name from DJI Fly's screen and tracks the foreground app so reads " +
                           "never disturb Fly's video. Enable \"DJI_FCC_GPSOFF — model & foreground\" in Accessibility settings. Stays on device."))
             .setPositiveButton(t("Открыть настройки", "Open settings")) { _, _ -> runCatching { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) } }
+            .setNegativeButton(t("Позже", "Later"), null)
+            .show()
+    }
+
+    /**
+     * Ask once about the battery-optimisation exemption.
+     *
+     * The setup wizard has a page for it, but an install made before that page existed — or
+     * one where the OS revoked the exemption — never sees it, and the symptom is FCC quietly
+     * reverting overnight with nothing in the log (a frozen process cannot write one). Only
+     * asked when auto-FCC is actually armed: it is the thing that needs to survive.
+     */
+    private fun maybePromptBattery() {
+        if (AppState.batteryPrompted || !AppState.autoKeepalive) return
+        if (Grants.batteryUnrestricted(this)) return
+        AppState.setBatteryPrompted(this, true)
+        android.app.AlertDialog.Builder(this)
+            .setTitle(t("Разрешить работу в фоне?", "Allow background running?"))
+            .setMessage(t("Авто-FCC переприменяет режим, пока пульт лежит с потухшим экраном. При включённой " +
+                          "оптимизации батареи Android замораживает приложение, FCC перестаёт переприменяться, " +
+                          "и в логе об этом ничего не будет — замороженный процесс не может даже записать строку. " +
+                          "Разрешение касается только этого приложения.",
+                          "Auto-FCC re-applies the mode while the controller lies idle with its screen off. With " +
+                          "battery optimisation on, Android freezes the app, FCC stops being re-applied, and the log " +
+                          "says nothing — a frozen process cannot write a line. The exemption covers this app only."))
+            .setPositiveButton(t("Разрешить", "Allow")) { _, _ ->
+                if (!Grants.openBatterySettings(this))
+                    setStatus(t("⚠ это устройство не открывает экраны оптимизации батареи",
+                                "⚠ this device offers no battery-optimisation screen"))
+            }
             .setNegativeButton(t("Позже", "Later"), null)
             .show()
     }

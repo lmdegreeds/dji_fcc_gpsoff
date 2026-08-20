@@ -8,6 +8,16 @@
     <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- Keep the FCC keepalive alive while the controller sits idle with the screen off.
+         A foreground service is not enough on its own: an optimised app is frozen, the
+         keepalive stops re-applying FCC, and nothing reports it — a frozen process cannot
+         write a log line either, so the only trace is a gap. This permission enables the
+         one-tap system dialog; the setup wizard asks for it, and falls back to the plain
+         optimisation list (which needs no permission) on ROMs that refuse the dialog.
+         NOTE: this intent is restricted on Google Play. This app is distributed as a
+         GitHub release, not through Play. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
     <!-- Self-update: download a release APK and hand it to the package installer.
          This only declares the capability — the user must still grant "install
          unknown apps" for this app (Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
