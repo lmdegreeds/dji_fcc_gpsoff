@@ -62,20 +62,30 @@ object DumlCapture {
         DumlTransport.acquire()
         val auxMsg = if (got >= 0) "aux hijack on $got" else "aux connect failed (Fly may hold $port)"
         DiagLog.info("capture started: $auxMsg — main channel up, recording main+aux frames")
+        // The clock anchor, so a captured frame can be lined up with the log line that
+        // describes it. pcap timestamps are baseMicros + a nanoTime delta while the log
+        // runs on currentTimeMillis; without this line the offset between the two is
+        // unrecoverable after the fact (2026-08-20).
+        DiagLog.info("capture clock anchor: pcap t0 = ${baseMicros / 1000} ms wall — the same clock as " +
+            "this line's timestamp, so /capframes ids and log lines share one timeline from here")
         return auxMsg
     }
 
     /** Turn capture off and close the aux reader (main channel is untouched). */
     fun stop(): String {
-        val seen: Long; val drop: Long
-        synchronized(this) { capturing = false; seen = nextId - 1; drop = dropped }
+        val seen: Long; val drop: Long; val held: Long
+        synchronized(this) { capturing = false; seen = nextId - 1; drop = dropped; held = ringBytes }
         // Close the aux reader OUTSIDE the lock: the native stop joins the RX
         // thread, which may be blocked in offer() waiting for this lock — holding
         // it here deadlocks (the hang that made "Disable capture" do nothing).
         // release() only really stops the reader if DroneLinkProbe isn't also holding it.
         AuxReader.release()
         DumlTransport.release()          // last holder drops the main channel again
-        DiagLog.info("capture stopped ($seen frames seen, $drop dropped)")
+        // Say what was KEPT, not only what was seen: the ring evicts oldest-first at its
+        // byte cap, so "41882 frames seen" alone does not tell a reader whether the
+        // seconds they care about are still in it.
+        DiagLog.info("capture stopped: $seen frame(s) seen, $drop dropped oldest-first by the byte cap, " +
+            "${held / 1024} KB held" + (if (seen > 0) " · ids 1…$seen" else ""))
         return "stopped"
     }
 

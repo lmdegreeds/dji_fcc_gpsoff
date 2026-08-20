@@ -14,21 +14,79 @@ object DeviceStore {
 
     private fun p(ctx: Context) = ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
 
+    /**
+     * HOW a remembered name-variant was decided (2026-08-20).
+     *
+     * Stored beside the value because the value alone is not enough to act on, and
+     * because the app must not present a remembered guess as a measurement — a user
+     * reading "Lito (probed)" reasonably concluded a probe had run and produced that
+     * answer, when in fact the line was a cache hit 56 ms after startup.
+     */
+    enum class VariantOrigin(val wire: String) {
+        /** `03:F7` answered Ok for one spelling: the aircraft said so. */
+        PROBE("probe"),
+        /** No spelling was confirmed, but one was explicitly denied, so the other was
+         *  taken on that negative alone. Weaker than [PROBE] and re-probable. */
+        NEGATIVE("negative"),
+        /** The user set it by hand. Outranks every probe. */
+        MANUAL("manual"),
+        /** Remembered by a build that did not record how it decided. Treated as
+         *  unverified — it is exactly the state the Air 3 report came from. */
+        LEGACY("legacy");
+
+        companion object {
+            fun of(w: String?): VariantOrigin = values().firstOrNull { it.wire == w } ?: LEGACY
+        }
+    }
+
+    /** A remembered name-variant with its provenance. */
+    class VariantRecord(val lito: Boolean, val origin: VariantOrigin, val atMs: Long) {
+        /** Can a probe overwrite this? A hand-made choice may not be overwritten. */
+        val isManual: Boolean get() = origin == VariantOrigin.MANUAL
+        /** Was it ever actually confirmed by the aircraft? */
+        val isMeasured: Boolean get() = origin == VariantOrigin.PROBE
+    }
+
     /** Save what we know for [serial]. [lito] null means "variant not determined". */
-    fun save(ctx: Context, serial: String, modelCode: String?, modelName: String?, lito: Boolean?) {
+    fun save(ctx: Context, serial: String, modelCode: String?, modelName: String?,
+             lito: Boolean?, origin: VariantOrigin? = null) {
         if (serial.isBlank()) return
         p(ctx).edit().apply {
             modelCode?.let { putString("$serial.code", it) }
             modelName?.let { putString("$serial.name", it) }
-            if (lito != null) putBoolean("$serial.lito", lito)
+            if (lito != null) {
+                putBoolean("$serial.lito", lito)
+                if (origin != null) {
+                    putString("$serial.litoSrc", origin.wire)
+                    putLong("$serial.litoAt", System.currentTimeMillis())
+                }
+            }
             putLong("$serial.at", System.currentTimeMillis())
         }.apply()
     }
 
     /** Remembered name-variant for [serial]: true = Lito names, false = other, null = unknown. */
-    fun variant(ctx: Context, serial: String): Boolean? {
+    fun variant(ctx: Context, serial: String): Boolean? = record(ctx, serial)?.lito
+
+    /** Remembered name-variant WITH its provenance, or null when nothing is stored. */
+    fun record(ctx: Context, serial: String): VariantRecord? {
+        if (serial.isBlank()) return null
         val pr = p(ctx)
-        return if (pr.contains("$serial.lito")) pr.getBoolean("$serial.lito", true) else null
+        if (!pr.contains("$serial.lito")) return null
+        // Migration: a build before 2026-08-20 stored only the value and a manual flag.
+        val origin = when {
+            pr.contains("$serial.litoSrc") -> VariantOrigin.of(pr.getString("$serial.litoSrc", null))
+            pr.getBoolean("$serial.litoManual", false) -> VariantOrigin.MANUAL
+            else -> VariantOrigin.LEGACY
+        }
+        // 0 = "when this was decided is not recorded". Deliberately NOT falling back to
+        // "$serial.at": save() rewrites that on every call, so a migrated record would be
+        // dated to the last time anything was stored — and the UI would report a years-old
+        // guess as minutes old (2026-08-20).
+        return VariantRecord(
+            pr.getBoolean("$serial.lito", true), origin,
+            pr.getLong("$serial.litoAt", 0L)
+        )
     }
 
     /**
@@ -40,17 +98,22 @@ object DeviceStore {
      */
     fun setManualVariant(ctx: Context, serial: String, lito: Boolean) {
         if (serial.isBlank()) return
-        p(ctx).edit().putBoolean("$serial.lito", lito).putBoolean("$serial.litoManual", true).apply()
+        p(ctx).edit()
+            .putBoolean("$serial.lito", lito)
+            .putBoolean("$serial.litoManual", true)
+            .putString("$serial.litoSrc", VariantOrigin.MANUAL.wire)
+            .putLong("$serial.litoAt", System.currentTimeMillis())
+            .apply()
         DiagLog.info("device store: manual name-variant for $serial = " + if (lito) "Lito" else "other")
     }
 
     /** Did the user set the variant for [serial] by hand? Then no probe may overwrite it. */
     fun variantIsManual(ctx: Context, serial: String): Boolean =
-        p(ctx).getBoolean("$serial.litoManual", false)
+        record(ctx, serial)?.isManual == true
 
     /**
-     * Forget everything remembered about the name-variant for [serial] — both the value and
-     * the manual flag — so the next [StartupProbe] run actually re-probes.
+     * Forget everything remembered about the name-variant for [serial] — the value, its
+     * provenance and the manual flag — so the next [StartupProbe] run actually re-probes.
      *
      * Clearing only the manual flag is not enough: the cached value still short-circuits
      * `known ?: detectVariant()`, so the probe never runs and "re-detect" silently returns
@@ -58,7 +121,8 @@ object DeviceStore {
      */
     fun clearVariant(ctx: Context, serial: String) {
         if (serial.isBlank()) return
-        p(ctx).edit().remove("$serial.lito").remove("$serial.litoManual").apply()
+        p(ctx).edit().remove("$serial.lito").remove("$serial.litoManual")
+            .remove("$serial.litoSrc").remove("$serial.litoAt").apply()
         DiagLog.info("device store: name-variant for $serial forgotten — it will be re-probed")
     }
 

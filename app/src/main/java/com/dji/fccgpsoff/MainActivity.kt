@@ -87,6 +87,7 @@ class MainActivity : Activity() {
     @Volatile private var flyStat = "?"
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        LogStore.componentUp("MainActivity")
         requestWindowFeature(Window.FEATURE_NO_TITLE)
         super.onCreate(savedInstanceState)
         AppState.load(applicationContext)
@@ -388,11 +389,15 @@ class MainActivity : Activity() {
 
         // Live state: LED / GPS / mode
         ledVal = valLabel(); gpsVal = valLabel(); modeVal = valLabel()
-        ledSw = stateSwitch({ on -> "LED " + if (on) t("вкл", "on") else t("выкл", "off") }) { on -> f.setLed(on) }
-        gpsSw = stateSwitch({ on -> "GPS " + if (on) t("вкл", "on") else t("выкл", "off") }) { on -> f.setGps(on) }
+        ledSw = stateSwitch(FlightState.Item.LED, false,
+            { on -> "LED " + if (on) t("вкл", "on") else t("выкл", "off") }) { on -> f.setLed(on, "the Main page") }
+        gpsSw = stateSwitch(FlightState.Item.GPS, false,
+            { on -> "GPS " + if (on) t("вкл", "on") else t("выкл", "off") }) { on -> f.setGps(on, "the Main page") }
         // Switch ON = ATTI (per user): on ⇒ ATTI, off ⇒ Cine. setFlightMode(cine) takes
-        // the Cine flag, so an ON toggle writes ATTI via !on.
-        modeSw = stateSwitch({ on -> t("режим ", "mode ") + if (on) "ATTI" else "Cine" }) { on -> f.setFlightMode(!on) }
+        // the Cine flag, so an ON toggle writes ATTI via !on — which is also why this row
+        // is the inverted one: FlightState holds `cine`, the switch shows ATTI.
+        modeSw = stateSwitch(FlightState.Item.MODE, true,
+            { on -> t("режим ", "mode ") + if (on) "ATTI" else "Cine" }) { on -> f.setFlightMode(!on, "the Main page") }
         val stateBody = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         stateBody.addView(stateRow("💡 LED", ledVal, ledSw))
         stateBody.addView(stateRow("📍 GPS", gpsVal, gpsSw), tightLp())
@@ -448,17 +453,64 @@ class MainActivity : Activity() {
     private fun rowLp() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(7) }
     private fun tightLp() = LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(3) }
 
-    /** A switch that performs a blind write; live state is confirmed by the read
-     *  loop. [action] returns whether the frame actually left the socket, so the
-     *  status reflects the real send result, not merely "no exception thrown". */
-    private fun stateSwitch(label: (Boolean) -> String, action: suspend (Boolean) -> Boolean) = mkSwitch(false).apply {
+    /**
+     * A switch that performs a blind write; live state is confirmed by the read loop.
+     * [action] returns whether the frame actually left the socket, so the status reflects
+     * the real send result, not merely "no exception thrown".
+     *
+     * The tap is registered with [FlightState.markWritten] BEFORE the write goes out.
+     * Without that, [startLoops]' three-second render tick could fire between the tap and
+     * the read-back and re-assert the cached pre-write value onto the thumb — which is what
+     * a user saw as "the GPS switch sometimes does not react and does not change position"
+     * (2026-08-20). The intent is dropped again the moment a read confirms or contradicts
+     * it, so the switch can never sit on a lie for longer than one read-back.
+     *
+     * [invert] is for the mode row, whose switch means ATTI while the stored value is Cine.
+     */
+    private fun stateSwitch(item: FlightState.Item, invert: Boolean,
+                            label: (Boolean) -> String, action: suspend (Boolean) -> Boolean) = mkSwitch(false).apply {
         setOnClickListener {
             val on = isChecked
+            val stored = if (invert) !on else on
+            FlightState.markWritten(item, stored)
+            DiagLog.info("tap: ${label(on)} — aircraft last read " +
+                (FlightState.value(item)?.let { v -> if (invert) (if (v) "Cine" else "ATTI") else (if (v) "on" else "off") }
+                    ?: "never") +
+                (if (FlightState.lastMs == 0L) "" else " (${(System.currentTimeMillis() - FlightState.lastMs) / 1000}s ago)"))
+            renderState()
             scope.launch {
                 val ok = runCatching { action(on) }.getOrDefault(false)
-                runOnUiThread { setStatus((if (ok) "✅ " else "⚠ ") + label(on) +
-                    if (ok) t(" (пишу…)", " (writing…)") else t(" — отправка не удалась", " — send failed")) }
-                if (ok) { delay(400); FlightState.refresh(); runOnUiThread { renderState() } }
+                // A frame that never left the socket is not an intent worth holding: drop it
+                // so the control goes straight back to what the aircraft last said.
+                if (!ok) FlightState.clearWritten(item)
+                runOnUiThread {
+                    setStatus((if (ok) "✅ " else "⚠ ") + label(on) +
+                        if (ok) t(" (пишу…)", " (writing…)") else t(" — отправка не удалась", " — send failed"))
+                    renderState()
+                }
+                if (ok) {
+                    delay(400)
+                    FlightState.refresh()
+                    runOnUiThread { renderState() }
+                    // A read-back that lands INSIDE the settle window cannot decide anything —
+                    // the board is known to answer with the old value for a few hundred ms
+                    // after a write that did land. Without this second look the intent would
+                    // stand until something else happened to read, and the panel would sit on
+                    // "writing…" indefinitely (2026-08-20).
+                    if (FlightState.wanted(item) != null) {
+                        delay(FlightState.SETTLE_MS - 400 + 200)
+                        runCatching { FlightState.refreshOne(item) }
+                    }
+                    runOnUiThread {
+                        renderState()
+                        // Say what the read-back actually decided, rather than leaving
+                        // "(writing…)" standing over a write that did not take.
+                        if (FlightState.wanted(item) == null && FlightState.value(item) != stored)
+                            setStatus(t("⚠ ", "⚠ ") + label(on) +
+                                t(" — борт не принял: читается прежнее значение. Проверьте профиль имён в Настройках.",
+                                  " — the aircraft did not take it: the old value reads back. Check the name profile in Settings."))
+                    }
+                }
             }
         }
     }
@@ -558,13 +610,64 @@ class MainActivity : Activity() {
 
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(12), dp(8), dp(12), dp(8)) }
         col.addView(card(dash))
+        // Export is the button that matters: it writes ONE file holding this session, the
+        // sessions before it and a state snapshot — which is what a maintainer with no
+        // access to the controller actually needs. Share is the convenience path and is
+        // bounded, because an Intent extra cannot carry a bundle.
         col.addView(rowc(
             smallBtn(t("Очистить", "Clear"), SLATE) { DiagLog.clear(); renderLog() },
-            smallBtn(t("Экспорт", "Export"), BLUE) { setStatus(t("сохранено: ", "saved: ") + DiagLog.export(applicationContext)); renderLog() },
+            smallBtn(t("Экспорт", "Export"), BLUE) {
+                scope.launch(Dispatchers.IO) {
+                    val e = DiagLog.exportFile(applicationContext)
+                    runOnUiThread { setStatus(t("сохранено: ", "saved: ") + e.path); renderLog() }
+                }
+            },
+            // Share attaches the exported FILE when MediaStore gives us a content:// URI
+            // (Android 10+), and falls back to a bounded text extra below that. The bundle
+            // is now several sessions long and an Intent extra crosses a Binder
+            // transaction with a hard ~1 MB limit — pasting it in would throw on exactly
+            // the reports worth sending (2026-08-20).
             smallBtn(t("Поделиться", "Share"), VIOLET) {
-                startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply {
-                    type = "text/plain"; putExtra(Intent.EXTRA_TEXT, DiagLog.asText()) }, t("Отправить лог", "Share log")))
+                scope.launch(Dispatchers.IO) {
+                    val e = DiagLog.exportFile(applicationContext)
+                    val uri = e.uri
+                    runOnUiThread {
+                        val send = if (uri != null) Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_STREAM, uri)
+                            putExtra(Intent.EXTRA_SUBJECT, "DJI_FCC_GPSOFF ${currentVersion()} — ${e.path}")
+                            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                        } else Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT,
+                                t("[показан только хвост; полный отчёт — файл ${e.path}]\n",
+                                  "[tail only; the full report is the file ${e.path}]\n") +
+                                    DiagLog.asText().takeLast(SHARE_MAX_CHARS))
+                        }
+                        // What is in the file, said at the moment it leaves the device.
+                        setStatus(t("отправляется: серийник дрона, модель пульта, версии приложений DJI, " +
+                                    "разрешения и журнал — ${e.path}",
+                                    "sending: aircraft serial, RC model, DJI app versions, grants and the " +
+                                    "log — ${e.path}"))
+                        startActivity(Intent.createChooser(send, t("Отправить лог", "Share log")))
+                    }
+                }
+            },
+            smallBtn(t("Стереть архив", "Clear archive"), SLATE) {
+                scope.launch(Dispatchers.IO) {
+                    val n = LogStore.clearPast(applicationContext)
+                    runOnUiThread {
+                        setStatus(t("удалено сохранённых сессий: $n", "deleted $n stored session(s)"))
+                    }
+                }
             }))
+        col.addView(TextView(this).apply {
+            text = t("«Экспорт» кладёт в Download один файл: снимок состояния, прошлые сессии и текущая. " +
+                     "Его и присылайте — по нему видно сборку, разрешения и что происходило до перезапуска.",
+                     "Export writes ONE file to Download: a state snapshot, the earlier sessions and this one. " +
+                     "That is the file to send — it carries the build, the grants and what happened before the restart.")
+            setTextColor(MUTED); textSize = 10.5f; setPadding(dp(2), dp(5), dp(2), 0)
+        })
         // A real ScrollView (not TextView + ScrollingMovementMethod): the latter
         // scrolls the text itself and paints a white text-selection highlight on the
         // line under the finger while dragging, and every new log line reset the
@@ -598,6 +701,7 @@ class MainActivity : Activity() {
                 // Flipping this by hand is an override that must survive the next startup
                 // probe — otherwise the cached variant is restored and silently wins.
                 AppState.setLito(this@MainActivity, isChecked)
+                StartupProbe.noteManual()   // else the panel still credits this to a probe
                 AircraftSession.serial.ifEmpty { StartupProbe.serial }
                     .takeIf { it.isNotEmpty() }
                     ?.let { DeviceStore.setManualVariant(this@MainActivity, it, isChecked) }
@@ -1257,14 +1361,20 @@ class MainActivity : Activity() {
         // A big filtered set is a long run on DJI Fly's port, so say how long before
         // starting one. A short list just goes.
         if (names.size <= VALUES_ASK_ABOVE) { go(); return }
+        // Pass 1 is one ask per name; the re-ask pass can widen an unresolved joined name
+        // to every candidate. Quote the range rather than the floor — an estimate that only
+        // counts the best case is not the run the user is agreeing to.
         val windows = (names.size + 15) / 16
+        val worst = (names.size * (if (names.any { ParamName.isJoined(it) } && ParamAlias.preferred < 0) 3 else 1)
+            + 15) / 16 + windows
         android.app.AlertDialog.Builder(this)
             .setTitle(t("Прочитать значения", "Read the values"))
             .setMessage(t(
-                "Показано ${names.size} параметров — это примерно $windows окон чтения по порту DJI Fly, " +
-                    "около ${windows * 2} с. Сузьте поиск или группу, если нужно быстрее.",
-                "${names.size} parameters are shown — about $windows read windows on DJI Fly's port, " +
-                    "roughly ${windows * 2}s. Narrow the search or the group for a faster run."))
+                "Показано ${names.size} параметров — от $windows до $worst окон чтения по порту DJI Fly, " +
+                    "примерно ${windows * 2}–${worst * 2} с. Сузьте поиск или группу, если нужно быстрее.",
+                "${names.size} parameters are shown — between $windows and $worst read windows on " +
+                    "DJI Fly's port, roughly ${windows * 2}-${worst * 2}s. Narrow the search or the " +
+                    "group for a faster run."))
             .setNegativeButton(t("Отмена", "Cancel"), null)
             .setPositiveButton(t("Читать", "Read")) { _, _ -> go() }
             .show()
@@ -1399,7 +1509,15 @@ class MainActivity : Activity() {
         fun refresh(label: String) {
             scope.launch {
                 val v = ParamRead.read(d.name)
-                val info = ParamMeta.info(d.name)
+                // Describe it by the SAME candidate set the read just used. Asking only the
+                // exact spelling here made the editor report "NO SUCH PARAMETER" — and grey
+                // out Write — for a value it had successfully read a line earlier, on any
+                // aircraft that indexes an alias rather than the joined name (2026-08-20).
+                val res = ParamMeta.resolve(ParamAlias.order(d.name))
+                res.name?.let { ParamAlias.note(d.name, it) }
+                if (res.allAbsent) ParamAlias.noteDenied(d.name)
+                val info: ConfigTable.Info? = res.info
+                    ?: if (res.allAbsent) ConfigTable.Info.Absent(ConfigTable.ST_NO_SUCH_PARAM) else null
                 runOnUiThread {
                     val board = when (info) {
                         null -> t("борт: нет ответа", "board: no answer")
@@ -1482,10 +1600,17 @@ class MainActivity : Activity() {
      *  wasn't confirmed). */
     private fun confirmParamWrite(d: ParamCatalog.Def, enc: ParamCatalog.Encoded.Ok, cur: ByteArray?,
                                   msg: TextView?, reset: Boolean) {
-        val hashHex = runCatching { DumlWire.toHex(DumlNative.nativeParamHash(d.name)) }.getOrDefault("?")
+        // The address the write will ACTUALLY use — ParameterAddress.name() prefers a
+        // measured spelling, so printing the hash of the catalog string could show a
+        // different address from the one the frame carries (2026-08-20).
+        val addr = ParameterAddress(d.name).let { it.name() to it.nameIsMeasured() }
+        val hashHex = runCatching { DumlWire.toHex(DumlNative.nativeParamHash(addr.first)) }.getOrDefault("?")
         val oldStr = cur?.let { "${ParamCatalog.decode(it, d.typeName)} (${DumlWire.toHex(it)})" }
             ?: t("неизвестно (чтение перед записью осталось без ответа)", "unknown (pre-write read went unanswered)")
-        val body = t("Параметр: ", "Parameter: ") + "${d.name}\nhash: $hashHex\n\n" +
+        val body = t("Параметр: ", "Parameter: ") + "${d.name}\n" +
+            t("адрес: ", "address: ") + "${addr.first}  hash $hashHex" +
+            (if (addr.second) t("  (измерено на этом борту)", "  (measured on this aircraft)")
+             else t("  (из профиля, на борту не проверено)", "  (from the profile, unverified here)")) + "\n\n" +
             t("было:  ", "old:   ") + "$oldStr\n" +
             t("стало: ", "new:   ") + "${ParamCatalog.decode(enc.bytes, d.typeName)} (${DumlWire.toHex(enc.bytes)})\n" +
             t("ширина: ", "width: ") + "${enc.widthNote}\n\n" +
@@ -1733,6 +1858,10 @@ class MainActivity : Activity() {
                     // "Прочитать состояние" button ([readStateNow]) or a write. This loop
                     // only RENDERS, from cached state plus passive serial/model updates.
                     flyStat = flyStatus()   // socket-free (a11y-derived)
+                    // Environment drift — the accessibility service dying, an overlay grant
+                    // revoked, a service stopping — noticed on a tick that already runs, so
+                    // it costs no timer and puts nothing on the bus. Silent when nothing moved.
+                    runCatching { Snapshot.logIfChanged(applicationContext, "setup changed") }
                     runOnUiThread { runCatching { renderDevice(); renderState() } }
                 }
                 delay(RENDER_INTERVAL_MS)
@@ -1749,13 +1878,13 @@ class MainActivity : Activity() {
         sb.append(t("дрон:  ", "drone: ")).append(if (d.code.isEmpty()) t("— (откройте DJI Fly)", "— (open DJI Fly)") else "${d.name} [${d.code}]").append('\n')
         sb.append(t("пульт: ", "RC:    ")).append(if (rc.code.isEmpty()) "—" else "${rc.name} [${rc.code}]").append('\n')
         sb.append("SN:    ").append(serial.ifEmpty { "—" }).append('\n')
+        // Provenance, not just the value: "Lito (probed)" was shown for a value restored
+        // from the device store 56 ms after startup, with no probe run at all, and a user
+        // reasonably took it as a measurement (2026-08-20). One sentence, one source of
+        // truth — the log and /profile print the same string.
         sb.append(t("имена: ", "names: ")).append(
-            when {
-                StartupProbe.readsFailed -> t("не отвечает", "not answering")
-                StartupProbe.variant == true -> t("Lito (опрошено)", "Lito (probed)")
-                StartupProbe.variant == false -> t("g_config.* (опрошено)", "g_config.* (probed)")
-                else -> if (AppState.litoMode) "Lito" else "g_config.*"
-            })
+            if (StartupProbe.readsFailed) t("не отвечает", "not answering")
+            else StartupProbe.provenance(AppState.uiRu))
         sb.append('\n').append("Fly:   ").append(flyStat)
         // No "link:" line. Deciding whether a drone is on the link needs a
         // flight-controller read, and those only happen when the user asks for one now
@@ -1770,17 +1899,39 @@ class MainActivity : Activity() {
     }
 
     private fun renderState() {
-        fun set(v: TextView, sw: Switch, b: Boolean?, onTxt: String, offTxt: String) {
-            when (b) {
-                true -> { v.text = onTxt; v.setTextColor(GREEN); sw.isChecked = true }
-                false -> { v.text = offTxt; v.setTextColor(MUTED); sw.isChecked = false }
-                null -> { v.text = "?"; v.setTextColor(AMBER) }
+        /**
+         * The CONTROL shows [FlightState.shown] — the user's unsettled intent while there
+         * is one, the aircraft's reading otherwise. The LABEL beside it always shows the
+         * aircraft's reading. Keeping them apart is the point: a write that has not been
+         * confirmed is then visible as "writing…" beside a thumb that stays where the user
+         * put it, instead of the thumb silently snapping back to a stale value.
+         */
+        fun set(v: TextView, sw: Switch, item: FlightState.Item, invert: Boolean, onTxt: String, offTxt: String) {
+            FlightState.shown(item)?.let { sw.isChecked = if (invert) !it else it }
+            val read = FlightState.value(item)
+            val pending = FlightState.wanted(item)
+            // Labels are given in STORED order (true -> onTxt), so the mode row passes
+            // "Cine"/"ATTI": only the thumb is inverted, never the wording.
+            val txt = { b: Boolean -> if (b) onTxt else offTxt }
+            when {
+                // Past the settle window a pending intent is not "still writing", it is
+                // "nothing has come back to settle this" — and the label has to say which.
+                pending != null -> {
+                    v.text = txt(pending) + (if (FlightState.pendingAgeMs(item) > FlightState.SETTLE_MS)
+                        t(" · не подтверждено", " · unconfirmed") else t(" · пишу…", " · writing…"))
+                    v.setTextColor(AMBER)
+                }
+                read == null -> { v.text = "?"; v.setTextColor(AMBER) }
+                else -> {
+                    v.text = txt(read)
+                    v.setTextColor(if (sw.isChecked) GREEN else MUTED)
+                }
             }
         }
-        set(ledVal, ledSw, FlightState.ledOn, t("вкл", "on"), t("выкл", "off"))
-        set(gpsVal, gpsSw, FlightState.gpsOn, t("вкл", "on"), t("выкл", "off"))
-        // ATTI is the "on" position now: pass the inverted cine flag (ATTI ⇒ true).
-        set(modeVal, modeSw, FlightState.cine?.let { !it }, "ATTI", "Cine")
+        set(ledVal, ledSw, FlightState.Item.LED, false, t("вкл", "on"), t("выкл", "off"))
+        set(gpsVal, gpsSw, FlightState.Item.GPS, false, t("вкл", "on"), t("выкл", "off"))
+        // ATTI is the "on" position: the stored value is `cine`, so this row is inverted.
+        set(modeVal, modeSw, FlightState.Item.MODE, true, "Cine", "ATTI")
         // Switches always stay enabled: a "no read-back" drone still takes blind
         // writes, per the honesty note above.
         // "Reading…" is claimed ONLY while readStateNow's job is on the bus, and it
@@ -1989,7 +2140,16 @@ class MainActivity : Activity() {
         // between the two apps costs FCC (2026-08-19). State is read when asked for: the
         // "Прочитать состояние" button, or after a write.
         super.onResume(); foreground = true; syncSwitches()
+        // A state snapshot when the user actually arrives — the second moment (after
+        // startup) at which a session begins, and the one a report is usually about. It
+        // reads properties and package info only: no socket, nothing on the DUML bus.
+        // Throttled so flipping between screens does not paper the log with it.
+        if (System.currentTimeMillis() - lastSnapshotMs > SNAPSHOT_MIN_GAP_MS) {
+            lastSnapshotMs = System.currentTimeMillis()
+            scope.launch(Dispatchers.Default) { runCatching { Snapshot.log(applicationContext, "app opened") } }
+        }
     }
+    private var lastSnapshotMs = 0L
     /**
      * Leaving this screen stops 40007 reads **immediately**, whatever we are leaving for.
      *
@@ -2067,11 +2227,7 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun isAccessibilityEnabled(): Boolean {
-        val want = android.content.ComponentName(this, DjiFlyAccessibilityService::class.java).flattenToString()
-        val flat = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
-        return flat.split(':').any { it.equals(want, ignoreCase = true) }
-    }
+    private fun isAccessibilityEnabled(): Boolean = Snapshot.isAccessibilityEnabled(this)
     /** Ask for POST_NOTIFICATIONS on Android 13+, so the foreground-service
      *  notifications (and their tap-to-open) are actually shown. */
     private fun maybeRequestNotifications() {
@@ -2211,6 +2367,11 @@ class MainActivity : Activity() {
     } catch (e: Exception) { "0.0.0.0" }
 
     override fun onDestroy() {
+        // A configuration change (the language toggle calls recreate()) destroys and
+        // rebuilds this Activity in the SAME process. That is not the end of a session, and
+        // treating it as one would stamp an end marker into the middle of a file that goes
+        // on growing — so only a real teardown counts.
+        if (!isChangingConfigurations) LogStore.componentDown("MainActivity")
         super.onDestroy()
         loopJob?.cancel()
         scope.cancel()                 // cancel every click-handler coroutine, not just the loop
@@ -2242,6 +2403,14 @@ class MainActivity : Activity() {
          *  window the view shows, so nothing visible is ever missing, and far fewer than the
          *  3000-entry buffer that used to be formatted in full. */
         private const val LOG_TAIL_LINES = 400
+        /** Do not re-snapshot on every screen change; a session's worth of context does
+         *  not change minute to minute, and the log is for reading. */
+        private const val SNAPSHOT_MIN_GAP_MS = 5 * 60_000L
+        /** Ceiling on what the Share action can hand to another app. An Intent extra
+         *  crosses a Binder transaction with a hard ~1 MB limit shared by everything in
+         *  flight, and a bundle with several stored sessions in it is well past that —
+         *  Share sends the tail and points at Export for the whole thing. */
+        private const val SHARE_MAX_CHARS = 200_000
         /** How long reads stay blocked after this screen loses the foreground. Covers a
          *  full app switch; a real window event lifts it sooner in either direction. */
         private const val LEAVING_BLOCK_MS = 3_000L

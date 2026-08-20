@@ -588,6 +588,7 @@ class SetupWizardActivity : Activity() {
             runCatching { StartupProbe.run(applicationContext) }
             manualLito?.let { v ->
                 AppState.setLito(applicationContext, v)
+                StartupProbe.noteManual()
                 AircraftSession.serial.ifEmpty { StartupProbe.serial }
                     .takeIf { it.isNotEmpty() }
                     ?.let { DeviceStore.setManualVariant(applicationContext, it, v) }
@@ -620,11 +621,7 @@ class SetupWizardActivity : Activity() {
 
     // ------------------------------------------------------------ grant state
 
-    private fun isAccessibilityEnabled(): Boolean {
-        val want = android.content.ComponentName(this, DjiFlyAccessibilityService::class.java).flattenToString()
-        val flat = Settings.Secure.getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES).orEmpty()
-        return flat.split(':').any { it.equals(want, ignoreCase = true) }
-    }
+    private fun isAccessibilityEnabled(): Boolean = Snapshot.isAccessibilityEnabled(this)
 
     private fun canInstallPackages(): Boolean =
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) packageManager.canRequestPackageInstalls() else true

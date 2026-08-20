@@ -73,19 +73,28 @@ object ParamRead {
     }
 
     /**
-     * Walk a 40007 window for the 03:F8 response whose echoed hash matches [hash]
-     * — the FC (and DJI Fly) poll many params, so the hash MUST match or we would
-     * return some other parameter's value. Returns the RAW payload of our reply.
+     * Walk a 40007 window for a 03:F8 response whose echoed hash matches ANY of
+     * [hashes] — the FC (and DJI Fly) poll many params, so the hash MUST match or we
+     * would return some other parameter's value. Returns the index of the hash that
+     * answered and the RAW payload of that reply.
+     *
+     * Several hashes because one logical parameter can have several spellings and
+     * therefore several addresses ([ParamName]); asking for all of them in the SAME
+     * window is what makes resolving a joined `a|b` name cost no extra window.
      */
-    private fun extract(stream: ByteArray, hash: ByteArray, len: Int = stream.size): ByteArray? =
+    private fun extractAny(stream: ByteArray, hashes: List<ByteArray>, len: Int = stream.size): Pair<Int, ByteArray>? =
         WrappedFrames.walk(stream, len) { fr ->
             if (fr.cmdSet == DumlWire.CMDSET_FLYC && fr.cmdId == DumlWire.CMDID_READ_PARAM_HASH && fr.isResponse) {
                 val pl = fr.payload
-                // The FC and DJI Fly poll many params — the echoed hash MUST match
-                // or we would return some other parameter's value.
-                if (pl.size >= 5 && pl[0].toInt() == 0 &&
-                    pl[1] == hash[0] && pl[2] == hash[1] && pl[3] == hash[2] && pl[4] == hash[3]
-                ) pl else null
+                if (pl.size < 5 || pl[0].toInt() != 0) null
+                else {
+                    var hit: Pair<Int, ByteArray>? = null
+                    for (i in hashes.indices) {
+                        val h = hashes[i]
+                        if (pl[1] == h[0] && pl[2] == h[1] && pl[3] == h[2] && pl[4] == h[3]) { hit = i to pl; break }
+                    }
+                    hit
+                }
             } else null
         }
 
@@ -110,15 +119,16 @@ object ParamRead {
      * which was quadratic and could burn the window on its own while DJI Fly's
      * video mirror was pushing bytes.
      */
-    private fun probeOnce(hash: ByteArray, name: String, windowMs: Int): ByteArray? {
-        val wire = request(hash)
-        DiagLog.tx(DumlWire.PORT_LED, "read $name 03:F8", wire)
+    private fun probeOnce(names: List<String>, hashes: List<ByteArray>, windowMs: Int): Pair<Int, ByteArray>? {
+        val wires = hashes.map { request(it) }
+        for (i in names.indices) DiagLog.tx(DumlWire.PORT_LED, "read ${ParamName.tag(names[i])} 03:F8", wires[i])
         return try {
             Socket().use { s ->
                 s.connect(InetSocketAddress(HOST, DumlWire.PORT_LED), 400)
                 s.soTimeout = SOCKET_POLL_MS
                 val out = s.getOutputStream()
-                out.write(wire); out.flush()
+                for (w in wires) out.write(w)
+                out.flush()
                 val ins = s.getInputStream()
                 val end = System.currentTimeMillis() + windowMs
                 var buf = ByteArray(16 * 1024)
@@ -141,26 +151,73 @@ object ParamRead {
                         // Re-scan from a frame's worth before the last scan so a reply
                         // split across two chunks is still found.
                         val from = maxOf(0, scanned - MAX_WRAPPED)
-                        extract(buf.copyOfRange(from, used), hash)?.let { return it }
+                        extractAny(buf.copyOfRange(from, used), hashes)?.let { return it }
                         scanned = used
                     }
                     // r == 0 → quiet poll tick; keep walking the window, do not resend.
                 }
                 null
             }
-        } catch (e: Exception) { DiagLog.err("param read $name: ${e.message}"); null }
+        } catch (e: Exception) { DiagLog.err("param read ${names.firstOrNull()}: ${e.message}"); null }
     }
 
-    /** RAW 03:F8 response payload for [name] with bounded retries; null if unanswered.
-     *  Re-checks the foreground gate before EACH attempt, so a switch to DJI Fly stops
-     *  the retry burst at once instead of finishing all attempts on its video port. */
+    /**
+     * RAW 03:F8 response payload for [name] with bounded retries; null if unanswered.
+     *
+     * Re-checks the foreground gate before EACH attempt, so a switch to DJI Fly stops
+     * the retry burst at once instead of finishing all attempts on its video port.
+     *
+     * A name with several spellings ([ParamName]) puts every candidate address into the
+     * SAME window — the wire loses whole windows, not individual requests, so N asks cost
+     * one window — and whichever answers both returns the value and settles the address
+     * for the rest of the session ([ParamAlias]). A plain name has one candidate and this
+     * is byte-for-byte what it always was.
+     *
+     * Every outcome is logged, because until 2026-08-20 an answered read and an unanswered
+     * one looked identical in a shared log: only the TX went in, and telling them apart
+     * meant counting retry lines and measuring the gaps between them.
+     */
     suspend fun readRaw(name: String, attempts: Int = DEFAULT_ATTEMPTS): ByteArray? = withContext(Dispatchers.IO) {
-        val hash = DumlNative.nativeParamHash(name)
+        val cands = ParamAlias.known(name)?.let { listOf(it) } ?: ParamAlias.order(name)
+        val hashes = cands.map { DumlNative.nativeParamHash(it) }
+        val t0 = System.currentTimeMillis()
+        var tried = 0
         repeat(attempts) {
-            if (!ForegroundGate.readsAllowed()) return@withContext null   // strict: bail between attempts (and up front)
-            probeOnce(hash, name, READ_WINDOW_MS)?.let { return@withContext it }
+            if (!ForegroundGate.readsAllowed()) {
+                // strict: bail between attempts (and up front)
+                ReadStats.gateBlocked()
+                // "Never asked" and "asked and got nothing" must not read the same. When
+                // `tried` is still 0 no window was ever opened, so the silence is ours.
+                DiagLog.info(if (tried == 0)
+                    "read ${ParamName.tag(cands[0])} — NOT ASKED, no window opened: " +
+                        (ForegroundGate.blockReason() ?: "read gate closed")
+                else
+                    "read ${ParamName.tag(cands[0])} — gave up after $tried/$attempts: " +
+                        (ForegroundGate.blockReason() ?: "read gate closed"))
+                return@withContext null
+            }
+            tried++
+            val hit = probeOnce(cands, hashes, READ_WINDOW_MS)
+            if (hit != null) {
+                val (idx, pl) = hit
+                ReadStats.answered()
+                if (cands.size > 1) ParamAlias.note(name, cands[idx])
+                val v = parseValue(pl)
+                DiagLog.info("read ${ParamName.tag(cands[idx])} = " +
+                    (v?.let { "${DumlWire.toHex(it)} (${it.size} B)" } ?: "status ${pl[0].toInt() and 0xFF}") +
+                    " · ${System.currentTimeMillis() - t0} ms · attempt $tried/$attempts")
+                return@withContext pl
+            }
+            // Counted per WINDOW, not per read: a read that needed three attempts opened
+            // three windows, and the answer rate the retry budgets are tuned to is a
+            // per-window figure.
+            ReadStats.silent()
             delay(80)
         }
+        DiagLog.info("read ${ParamName.tag(cands[0])} — NO ANSWER" +
+            (if (cands.size > 1) " on any of ${cands.size} spelling(s)" else "") +
+            " · $tried attempt(s) · ${System.currentTimeMillis() - t0} ms " +
+            "(silence on this bus is 'no route back', not 'absent' — use 03:F7 to tell them apart)")
         null
     }
 
@@ -196,18 +253,42 @@ object ParamRead {
         val out = HashMap<String, ByteArray>()
         val wanted = names.distinct()
         if (wanted.isEmpty()) return@withContext out
+        // Learn the aircraft's naming convention ONCE before spending sixty windows on
+        // it. Firmwares are consistent about which half of a joined `a|b` name they
+        // index, so one decisive 03:F7 round on a single representative name settles the
+        // spelling for the whole catalog — far cheaper than putting every candidate of
+        // every row into the batch. When nothing is joined this does nothing at all.
+        if (ParamAlias.preferred < 0) wanted.firstOrNull { ParamName.isJoined(it) }
+            ?.let { ParamAlias.resolve(it) }
         var todo = wanted
-        repeat(BATCH_PASSES) {
+        repeat(BATCH_PASSES) { pass ->
             if (todo.isEmpty()) return@repeat
             val missed = ArrayList<String>()
-            for (chunk in todo.chunked(BATCH_DEPTH)) {
+            // Pass 1 asks the ONE spelling we believe in; the re-ask pass widens to every
+            // candidate, so a name whose convention differs from the rest still gets its
+            // chance without doubling the traffic for the ones that don't. Chunking is by
+            // ASK, not by name — a widened pass must still put only [BATCH_DEPTH] requests
+            // in a window, or the batch that was measured is not the batch being sent.
+            val plan = ArrayList<Pair<String, String>>(todo.size)     // name -> spelling to ask
+            for (name in todo) {
+                // A spelling MEASURED for this exact name beats the catalog-wide hint, and
+                // it is then the only one worth asking. Same precedence as [readRaw]; the
+                // two disagreeing would have made a bulk read miss rows a single read finds.
+                val known = ParamAlias.known(name)
+                when {
+                    known != null -> plan.add(name to known)
+                    pass == 0 -> plan.add(name to ParamAlias.order(name).first())
+                    else -> for (sp in ParamAlias.order(name)) plan.add(name to sp)
+                }
+            }
+            for (chunk in plan.chunked(BATCH_DEPTH)) {
                 if (!ForegroundGate.readsAllowed()) {
                     DiagLog.warn("readMany: stopped — ${ForegroundGate.blockReason()}")
                     return@withContext out
                 }
-                val asks = chunk.map { name ->
-                    val hash = DumlNative.nativeParamHash(name)
-                    DumlWindow.Ask("read $name 03:F8", request(hash)) { fr ->
+                val asks = chunk.map { (_, sp) ->
+                    val hash = DumlNative.nativeParamHash(sp)
+                    DumlWindow.Ask("read ${ParamName.tag(sp)} 03:F8", request(hash)) { fr ->
                         if (fr.cmdSet != DumlWire.CMDSET_FLYC ||
                             fr.cmdId != DumlWire.CMDID_READ_PARAM_HASH || !fr.isResponse
                         ) null
@@ -218,15 +299,23 @@ object ParamRead {
                     }
                 }
                 val got = DumlWindow.collect(DumlWire.PORT_LED, asks, BATCH_WINDOW_MS)
-                for (k in chunk.indices) {
-                    val v = got[k]?.let { parseValue(it) }
-                    if (v == null) missed.add(chunk[k]) else out[chunk[k]] = v
+                // One collect is one window, so it is one outcome for the answer rate —
+                // whole windows are what this bus loses.
+                if (got.any { it != null }) ReadStats.answered() else ReadStats.silent()
+                for (a in chunk.indices) {
+                    val v = got[a]?.let { parseValue(it) } ?: continue
+                    val (name, sp) = chunk[a]
+                    if (out.containsKey(name)) continue
+                    out[name] = v
+                    if (sp != name) ParamAlias.note(name, sp)
                 }
                 onProgress(out.size, wanted.size)
                 delay(BATCH_GAP_MS)
             }
+            for (n in todo) if (!out.containsKey(n)) missed.add(n)
             todo = missed
-            if (todo.isNotEmpty()) DiagLog.info("readMany: ${todo.size} of ${wanted.size} unanswered — re-asking")
+            if (todo.isNotEmpty()) DiagLog.info("readMany: ${todo.size} of ${wanted.size} unanswered — re-asking" +
+                (if (todo.any { ParamName.isJoined(it) }) " (widening to every spelling)" else ""))
         }
         DiagLog.info("readMany: ${out.size}/${wanted.size} values read")
         out

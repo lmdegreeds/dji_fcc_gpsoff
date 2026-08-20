@@ -9,12 +9,27 @@ package com.dji.fccgpsoff
  */
 object Diagnostics {
 
-    /** Read the profile-selected name of a logical parameter and report it + the value. */
+    /**
+     * Read a logical parameter and report it + the value.
+     *
+     * Reads by the logical KEY, not by the profile's guess at the spelling: [ParamRead]
+     * puts every address the parameter can have into one window, so this says what the
+     * aircraft answers to rather than what a stored profile assumed (2026-08-20).
+     */
     suspend fun readKnown(label: String, addr: ParameterAddress): String {
+        if (!ForegroundGate.readsAllowed())
+            return "$label: not asked — " + (ForegroundGate.blockReason() ?: "read gate closed")
+        // ONE window per parameter, not the default three: this endpoint reads four of them
+        // in a row on 40007, which is DJI Fly's video mirror, and a diagnostic must not cost
+        // twelve windows there. A single miss is reported as a miss.
+        val asked = ParamAlias.known(addr.key)?.let { listOf(it) } ?: ParamAlias.order(addr.key)
+        val v = ParamRead.read(addr.key, attempts = 1)
         val n = addr.name()
-        val v = addr.read()
-        return if (v == null) "$label: no answer (sent $n, hash ${DumlWire.toHex(DumlNative.nativeParamHash(n))})"
-               else "$label ($n): ${DumlWire.toHex(v)}"
+        return if (v == null)
+            "$label: no answer in one window · asked " + asked.joinToString(", ") { ParamName.tag(it) } +
+                " · a write would go to ${ParamName.tag(n)}"
+        else "$label (${ParamName.tag(n)}" +
+            (if (addr.nameIsMeasured()) ", measured" else ", from the profile") + "): ${DumlWire.toHex(v)}"
     }
 
     /** Read an arbitrary parameter by exact name (hash computed at runtime). */

@@ -56,9 +56,13 @@ object CrashLog {
             append(sw.toString())
         }
 
-        runCatching { DiagLog.err("CRASH on ${thread.name}: ${e}") }
-
         val name = "$PREFIX${stamp.format(now)}.txt"
+        runCatching { DiagLog.err("CRASH on ${thread.name}: $e — full trace in $name") }
+        // And get it, and the lines that led to it, onto disk NOW. The store flushes on a
+        // 15-second timer; this process has no 15 seconds left, and losing exactly the
+        // run-up to a crash is the one loss that cannot be worked around afterwards.
+        runCatching { LogStore.markEnd("uncaught ${e.javaClass.simpleName} on ${thread.name}", clean = false) }
+
         runCatching {
             File(ctx.getExternalFilesDir(null) ?: ctx.filesDir, name).writeText(text)
         }
@@ -74,6 +78,12 @@ object CrashLog {
             }
         }
     }
+
+    /** Newest stored crash FILE, without reading it. Cheap enough for App.onCreate, where
+     *  only its name, size and timestamp are wanted. */
+    fun latestFile(ctx: Context): File? =
+        (ctx.getExternalFilesDir(null) ?: ctx.filesDir)
+            .listFiles { file -> file.name.startsWith(PREFIX) }?.maxByOrNull { it.lastModified() }
 
     /** Newest stored crash, or null. Used to surface it on the next launch. */
     fun latest(ctx: Context): Pair<File, String>? {

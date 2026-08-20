@@ -118,6 +118,11 @@ object DiagServer {
     // can't pin a worker for an arbitrary duration.
     private const val MAX_WINDOW_MS = 10_000
 
+    /** Who a live-state write is attributed to when it comes from here. The web dashboard
+     *  is the one route a person at the controller cannot see happening, so a log that
+     *  does not name it leaves the aircraft changing state for no visible reason. */
+    private const val WEB = "the web dashboard (:$PORT)"
+
     private val activeConns = AtomicInteger(0)
     private val lifecycleLock = Any()
 
@@ -447,7 +452,19 @@ object DiagServer {
             "\"keepaliveActiveMode\":\"${FccKeepaliveService.activeMode?.wire ?: ""}\"," +
             "\"overlayRunning\":${OverlayService.running},\"diagRunning\":$isRunning," +
             "\"fccRegion\":\"${AppState.fccRegion.code}\",\"fccRegionLabel\":${Json.quote(AppState.fccRegion.label)}," +
-            "\"a11y\":${ForegroundGate.accessibilityConnected}}"
+            "\"a11y\":${ForegroundGate.accessibilityConnected}," +
+            // Added 2026-08-20: "is accessibility on" was a single bool that meant BOUND,
+            // and the setting being on with nothing bound is a different failure. Same for
+            // the update settings, which decide whether a published prerelease is ever
+            // offered, and for where the name profile came from.
+            "\"a11yEnabled\":${Snapshot.isAccessibilityEnabled(appCtx)}," +
+            "\"autoUpdateCheck\":${AppState.autoUpdateCheck},\"updatePrerelease\":${AppState.updatePrerelease}," +
+            "\"lastUpdateCheckMs\":${AppState.lastUpdateCheckMs}," +
+            "\"nameProfile\":${Json.quote(StartupProbe.provenance())}," +
+            "\"gpsAddress\":${Json.quote(ParameterAddress.GPS_ENABLE.name())}," +
+            "\"gpsAddressMeasured\":${ParameterAddress.GPS_ENABLE.nameIsMeasured()}," +
+            "\"aliasesResolved\":${ParamAlias.resolvedCount}," +
+            "\"session\":${Json.quote(DiagLog.sessionId)},\"build\":${Json.quote(AppVersion.of(appCtx))}}"
 
     /**
      * The loaded catalog (filtered by [q], and by [editOnly] to drop the entries
@@ -644,9 +661,20 @@ object DiagServer {
                 }
                 "/log" -> DiagLog.asText()
                 "/logjson" -> DiagLog.asJson()
+                // Everything a maintainer needs in ONE response: the state snapshot, the
+                // stored earlier sessions and the live one. This is /log's answer to the
+                // question /log could never answer — what happened before the restart.
+                "/logfile" -> DiagLog.bundle(appCtx)
+                // What the app is and how it is set up, without perturbing anything: no
+                // socket, no DUML frame. Read this first when a log looks strange.
+                "/snapshot" -> Snapshot.text(appCtx, "http")
                 // Which build is actually running. Ask this BEFORE interpreting a log
-                // pulled from a live controller — see CLAUDE.md.
-                "/version" -> AppVersion.of(appCtx)
+                // pulled from a live controller — see CLAUDE.md. The signing key is part
+                // of the answer: a debug-key and a release-key build of the same version
+                // are otherwise indistinguishable, and only one can update an install.
+                "/version" -> AppVersion.of(appCtx) + " · signing key " +
+                    (runCatching { AppSignature.ownTag(appCtx) }.getOrDefault("").ifEmpty { "unknown" }) +
+                    " · session " + DiagLog.sessionId
                 "/stats" -> DumlBus.stats()
                 "/ports" -> DumlBus.probePorts()
                 // The main channel is on-demand: /connect raises it by hand and holds it
@@ -744,14 +772,18 @@ object DiagServer {
                     query(path, "lito")?.let {
                         val v = it == "1" || it.equals("true", true)
                         AppState.setLito(appCtx, v)
+                        StartupProbe.noteManual()
                         // Same rule as the in-app switch: an explicit choice is an override
                         // and must outrank whatever the next startup probe concludes.
                         AircraftSession.serial.ifEmpty { StartupProbe.serial }
                             .takeIf { s -> s.isNotEmpty() }
                             ?.let { s -> DeviceStore.setManualVariant(appCtx, s, v) }
                     }
-                    "profile: " + (if (AppState.litoMode) "Lito X1 names" else "other DJI names") +
-                        if (query(path, "lito") != null) " (manual — the startup probe will not overwrite it)" else ""
+                    "profile: " + StartupProbe.provenance() +
+                        (if (query(path, "lito") != null) " (manual — the startup probe will not overwrite it)" else "") +
+                        "\nGPS writes address " + ParamName.tag(ParameterAddress.GPS_ENABLE.name()) +
+                        (if (ParameterAddress.GPS_ENABLE.nameIsMeasured()) " (measured on this aircraft)"
+                         else " (from the profile — not verified on this aircraft)")
                 }
                 "/profile/detect" -> {
                     // Drop the cached VALUE too, not just the manual flag — otherwise
@@ -759,9 +791,10 @@ object DiagServer {
                     val s = AircraftSession.serial.ifEmpty { StartupProbe.serial }
                     if (s.isNotEmpty()) DeviceStore.clearVariant(appCtx, s)
                     StartupProbe.run(appCtx)
-                    "re-probed: " + (if (AppState.litoMode) "Lito X1 names" else "other DJI names") +
-                        " (variant=${StartupProbe.variant}" +
-                        (if (StartupProbe.variant == null) ", undecided — profile left as it was" else "") + ")"
+                    "re-probed: " + StartupProbe.provenance() +
+                        (if (StartupProbe.variant == null) " (undecided — profile left as it was)" else "") +
+                        (if (StartupProbe.noKnownSpelling)
+                            "\nThis aircraft denied EVERY spelling we know for the probe parameter." else "")
                 }
                 // One switch per service, same as the app: setting a flag also RUNS or
                 // STOPS the service. Since 2026-08-19 the two are one control everywhere,
@@ -847,10 +880,10 @@ object DiagServer {
                     DiagLog.tx(0x205, "duss/send", DumlWire.hex(hex))
                     "duss/send (legacy abstract 0x205, fire-and-forget): " + if (ok) "sent" else "failed (connect/write)"
                 }
-                "/ledon" -> "led=" + f.setLed(true)
-                "/ledoff" -> "led=" + f.setLed(false)
-                "/gpson" -> "gps=" + f.setGps(true)
-                "/gpsoff" -> "gps=" + f.setGps(false)
+                "/ledon" -> "led=" + f.setLed(true, WEB)
+                "/ledoff" -> "led=" + f.setLed(false, WEB)
+                "/gpson" -> "gps=" + f.setGps(true, WEB)
+                "/gpsoff" -> "gps=" + f.setGps(false, WEB)
                 "/deviceinfo" -> f.deviceInfo()?.let { DumlWire.toHex(it) } ?: "no reply"
                 "/serial" -> {
                     // ?live=1 requires a genuine 00:51 reply (drone answering now), not the
@@ -940,7 +973,7 @@ object DiagServer {
                     val ms = (query(path, "ms")?.toIntOrNull() ?: 1000).coerceIn(0, MAX_WINDOW_MS)
                     probe(port, DumlWire.hex(hex), ms)
                 }
-                "/help" -> "endpoints: /version /log /logjson /stats /applyat?sec=&then=&count=&cancel=1 /applyat/status /ports /connect /disconnect /fcc " +
+                "/help" -> "endpoints: /version /snapshot /logfile /log /logjson /stats /applyat?sec=&then=&count=&cancel=1 /applyat/status /ports /connect /disconnect /fcc " +
                         "/frames /exp?keep=|drop=&label=&count=&gap=&rounds=&reg= /exp/status /exp/cancel /exp/verdict?power=&r58=&note= /exp/log " +
                         "/foreground /identity /identity/forget /model /rc /screen /a11y " +
                         "/keepon?mode=home_point|periodic /keepoff /overlayon /overlayoff " +
@@ -1302,9 +1335,11 @@ object DiagServer {
    document.getElementById('pf-other').className=s.lito?'s':'g1';
    function ab(id,on,lbl){var b=document.getElementById(id);if(!b)return;b.textContent=lbl+': '+(on?'ON':'off');b.className=on?'g1':'b';}
    ab('au-ka',s.autoKeepalive,'Keepalive');ab('au-ov',s.autoOverlay,'Overlay');ab('au-diag',s.autoDiag,'Diag');
-   document.getElementById('st-device').innerHTML='profile: <b>'+(s.lito?'Lito X1':'other DJI')+'</b>';
+   document.getElementById('st-device').innerHTML='names: <b>'+esc(s.nameProfile||'')+'</b><br>GPS writes go to <b>'+
+    esc(s.gpsAddress||'?')+'</b> ('+(s.gpsAddressMeasured?'measured on this aircraft':'assumed from the profile')+')';
    document.getElementById('st-svc').innerHTML='keepalive <b>'+(s.keepaliveRunning?('on ('+esc(s.keepaliveActiveMode||'')+')'):'off')+
-    '</b> &middot; overlay <b>'+(s.overlayRunning?'on':'off')+'</b> &middot; a11y <b>'+(s.a11y?'on':'off')+'</b>';
+    '</b> &middot; overlay <b>'+(s.overlayRunning?'on':'off')+'</b> &middot; a11y service <b>'+(s.a11y?'bound':'NOT bound')+
+    '</b> (settings: '+(s.a11yEnabled?'on':'OFF')+')';
   }).catch(function(){});
   Promise.all([
    fetch('/link').then(function(r){return r.json()}).catch(function(){return null}),

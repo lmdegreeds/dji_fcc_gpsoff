@@ -50,6 +50,7 @@ class OverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LogStore.componentUp("OverlayService")
         AppState.load(applicationContext)   // ensure the saved overlay position is loaded (START_STICKY / boot)
         ForegroundServices.enter(this, NOTIF_ID, buildNotif())
         running = true
@@ -120,8 +121,8 @@ class OverlayService : Service() {
         // as a warning rather than a tick.
         col.addOne(t("📡 Включить FCC", "📡 Enable FCC"), 0x9922C993.toInt()) { f.applyFcc() }
         // Quick toggles only (LED / GPS) — wired to THIS app's Features.
-        col.addTwo(t("💡 LED ВКЛ", "💡 LED ON"), { f.setLed(true) }, t("LED ВЫКЛ", "LED OFF"), { f.setLed(false) })
-        col.addTwo(t("📍 GPS ВКЛ", "📍 GPS ON"), { f.setGps(true) }, t("GPS ВЫКЛ", "GPS OFF"), { f.setGps(false) })
+        col.addTwo(t("💡 LED ВКЛ", "💡 LED ON"), { f.setLed(true, "the floating panel") }, t("LED ВЫКЛ", "LED OFF"), { f.setLed(false, "the floating panel") })
+        col.addTwo(t("📍 GPS ВКЛ", "📍 GPS ON"), { f.setGps(true, "the floating panel") }, t("GPS ВЫКЛ", "GPS OFF"), { f.setGps(false, "the floating panel") })
         // Whatever the user pinned in the parameter editor, below the built-in three.
         val pins = OverlayParams.list(applicationContext)
         for (pin in pins) col.addPin(pin)
@@ -283,6 +284,7 @@ class OverlayService : Service() {
     private fun dp(v: Int) = Math.round(v * resources.displayMetrics.density)
 
     override fun onDestroy() {
+        LogStore.componentDown("OverlayService")
         super.onDestroy()
         running = false
         scope.cancel()                                  // drop in-flight LED/GPS writes

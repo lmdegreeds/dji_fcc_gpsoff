@@ -16,12 +16,14 @@ class DiagService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LogStore.componentUp("DiagService")
         ForegroundServices.enter(this, NOTIF_ID, notif())
         DiagServer.start(applicationContext)
         return START_STICKY
     }
 
     override fun onDestroy() {
+        LogStore.componentDown("DiagService")
         DiagServer.stop()
         super.onDestroy()
     }

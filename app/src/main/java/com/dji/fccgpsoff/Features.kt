@@ -97,20 +97,69 @@ class Features(ctx: Context) {
     // aircraft reboot, and this build is FCC-only. The ce_restore.json asset is
     // kept for reference/native, but nothing in the app plays it.
 
-    /** Arm LEDs on/off — name-addressed, UNWRAPPED inject port 40008 (never
-     *  40007: that is DJI Fly's video mirror). Few writes, spaced, to keep the
-     *  shared bus quiet. */
-    suspend fun setLed(on: Boolean): Boolean =
-        ParameterAddress.FOREARM_LED.write(byteArrayOf(if (on) 0xEF.toByte() else 0x00), writes = 2, gapMs = 120)
+    /**
+     * Arm LEDs on/off — name-addressed, UNWRAPPED inject port 40008 (never 40007: that is
+     * DJI Fly's video mirror). Few writes, spaced, to keep the shared bus quiet.
+     *
+     * [by] names WHO asked, and it is not decoration. There are three routes to this
+     * function — the Main page, the floating panel and the web dashboard — and until
+     * 2026-08-20 only the first of them told [FlightState] that a write had happened. The
+     * other two left the cached value describing a state that no longer existed, so the
+     * Main page could show a reading nobody had set and its switch could snap to it. Every
+     * route now goes through [note], which is the single place a write is registered.
+     */
+    suspend fun setLed(on: Boolean, by: String = ANON): Boolean =
+        note(FlightState.Item.LED, on, if (on) "on" else "off", by,
+            ParameterAddress.FOREARM_LED.write(byteArrayOf(if (on) 0xEF.toByte() else 0x00), writes = 2, gapMs = 120))
 
-    /** Master GNSS switch — name-addressed. */
-    suspend fun setGps(on: Boolean): Boolean =
-        ParameterAddress.GPS_ENABLE.write(byteArrayOf(if (on) 1 else 0), writes = 2, gapMs = 120)
+    /** Master GNSS switch — name-addressed. See [setLed] for what [by] is for. */
+    suspend fun setGps(on: Boolean, by: String = ANON): Boolean =
+        note(FlightState.Item.GPS, on, if (on) "on" else "off", by,
+            ParameterAddress.GPS_ENABLE.write(byteArrayOf(if (on) 1 else 0), writes = 2, gapMs = 120))
 
     /** Flight mode: Cine (12) when [cine], else ATTI (3). Name-addressed, 40008. */
-    suspend fun setFlightMode(cine: Boolean): Boolean =
-        ParameterAddress.FLIGHT_MODE.write(
-            byteArrayOf(if (cine) ParameterAddress.MODE_CINE else ParameterAddress.MODE_ATTI), writes = 2, gapMs = 120)
+    suspend fun setFlightMode(cine: Boolean, by: String = ANON): Boolean =
+        note(FlightState.Item.MODE, cine, if (cine) "Cine" else "ATTI", by,
+            ParameterAddress.FLIGHT_MODE.write(
+                byteArrayOf(if (cine) ParameterAddress.MODE_CINE else ParameterAddress.MODE_ATTI),
+                writes = 2, gapMs = 120))
+
+    /**
+     * Register a live-state write, whoever asked for it.
+     *
+     * The pending intent is recorded even when the frames failed to leave the socket, then
+     * immediately withdrawn — recording and withdrawing is what makes the failure appear in
+     * the log as an event rather than as nothing at all. On success the intent stands until
+     * a read-back confirms or contradicts it ([FlightState.observe]).
+     *
+     * The Main page marks the intent a second time, at TAP time; that is deliberate, not a
+     * duplicate. The tap has to be held from the instant the finger lifts (a render tick
+     * could otherwise fire in between), while the settle window has to be measured from
+     * when the frames actually went out. Two different, both correct, timestamps.
+     */
+    private fun note(item: FlightState.Item, stored: Boolean, word: String, by: String, sent: Boolean): Boolean {
+        // Never blindly overwrite the standing intent. Two taps on the same switch race
+        // through independent coroutines, and the slower one finishing must not put back
+        // the value the user has already changed their mind about (2026-08-20).
+        val standing = FlightState.wanted(item)
+        when {
+            !sent && standing == stored -> FlightState.clearWritten(item)
+            !sent -> {}                                     // a newer intent stands; leave it
+            standing == null -> FlightState.markWritten(item, stored)   // overlay / dashboard
+            standing == stored -> FlightState.retimeCurrent(item)       // our own tap, now sent
+            else -> {}                                      // superseded by a newer tap
+        }
+        DiagLog.info("${item.label} → $word · asked by $by · " +
+            (if (sent) "recorded as a pending write; a read-back can still contradict it"
+             else "NOT SENT — no frame left the socket, nothing is pending"))
+        return sent
+    }
+
+    /** Default author. A write whose origin is not named is a write nobody can account for,
+     *  so every in-tree caller passes a real one and this exists only to keep the signature
+     *  usable from a scratch experiment. */
+    private val ANON = "an unnamed caller"
+
 
     /** Read HW/LDR/app version (VersionInquiry). Null is the norm on RC2 —
      *  injected reads are not routed back to us. */

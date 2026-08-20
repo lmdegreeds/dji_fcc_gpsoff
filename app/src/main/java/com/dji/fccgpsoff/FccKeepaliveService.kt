@@ -56,6 +56,7 @@ class FccKeepaliveService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LogStore.componentUp("FccKeepaliveService")
         // A START_STICKY restart hands us a null intent in what may be a fresh
         // process, where AppState still holds compile-time defaults — reload the
         // saved prefs so the mode/flags are the user's, not the defaults.
@@ -63,7 +64,14 @@ class FccKeepaliveService : Service() {
         val mode = KeepaliveMode.of(intent?.getStringExtra(EXTRA_MODE) ?: AppState.keepaliveMode.wire)
         ForegroundServices.enter(this, NOTIF_ID, buildNotification(mode))
         running = true
-        if (loop != null && mode == activeMode) return START_STICKY   // already in this mode
+        if (loop != null && mode == activeMode) {
+            // Used to return here in total silence, so a START_STICKY restart into a fresh
+            // process left no marker at all and two process lifetimes ran together in one
+            // log with nothing between them (2026-08-20).
+            DiagLog.info("keepalive: re-start ignored — already running in ${mode.label}" +
+                (if (intent == null) " (START_STICKY restart by the system)" else ""))
+            return START_STICKY
+        }
         loop?.cancel()
         activeMode = mode
         DiagLog.info("keepalive: mode = ${mode.label}")
@@ -92,14 +100,9 @@ class FccKeepaliveService : Service() {
      * status field that showed it — a field nobody reads while the app looks healthy.
      */
     private fun warnIfBlind() {
-        val on = runCatching {
-            val expected = android.content.ComponentName(this, DjiFlyAccessibilityService::class.java)
-            android.provider.Settings.Secure.getString(
-                contentResolver, android.provider.Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
-            ).orEmpty().split(':')
-                .mapNotNull(android.content.ComponentName::unflattenFromString)
-                .any { it == expected }
-        }.getOrDefault(false)
+        // One implementation of this query, in [Snapshot] — it existed here and in two
+        // Activities with two different comparison strategies (2026-08-20).
+        val on = Snapshot.isAccessibilityEnabled(this)
         if (!on) DiagLog.warn(
             "keepalive: ACCESSIBILITY SERVICE IS OFF — the aircraft-link detector is dead, so FCC " +
             "is applied on bare timers instead of when the drone appears. Android switches this off " +
@@ -462,6 +465,9 @@ class FccKeepaliveService : Service() {
     }
 
     override fun onDestroy() {
+        LogStore.componentDown("FccKeepaliveService")
+        DiagLog.info("keepalive: STOPPED (was ${activeMode?.label ?: "idle"}) — " +
+            "FCC is no longer being re-applied")
         running = false
         activeMode = null
         DroneLinkProbe.stop()               // release any 40007 aux lease we hold

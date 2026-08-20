@@ -68,11 +68,26 @@ object ForegroundServices {
         } else {
             service.startForeground(notifId, notif)
         }
+        // Say so on success as well as on failure (2026-08-20). Only failures were logged,
+        // so a service running WITHOUT a visible notification — POST_NOTIFICATIONS denied on
+        // API 33+, which makes the OS far readier to kill it — was indistinguishable in a
+        // shared log from a service that was never started.
+        DiagLog.info("${service.javaClass.simpleName}: entered foreground (notif $notifId, " +
+            (if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) "type=specialUse"
+             else "no FGS type — API ${Build.VERSION.SDK_INT}") +
+            ", notifications " + (if (notificationsAllowed(service)) "permitted" else "DENIED") + ")")
         true
     } catch (e: Exception) {
         DiagLog.err("${service.javaClass.simpleName}: startForeground failed — ${e.message}")
         false
     }
+
+    private fun notificationsAllowed(ctx: Context): Boolean = runCatching {
+        if (Build.VERSION.SDK_INT >= 33)
+            ctx.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+        else true
+    }.getOrDefault(true)
 
     /** Start a service in the foreground (API 26+) or plain (older), crash-safe. */
     fun launch(ctx: Context, cls: Class<out Service>, extras: (Intent.() -> Unit)? = null) {
@@ -86,6 +101,7 @@ object ForegroundServices {
     }
 
     fun stop(ctx: Context, cls: Class<out Service>) {
+        DiagLog.info("stopping ${cls.simpleName}")
         runCatching { ctx.stopService(Intent(ctx, cls)) }
     }
 }

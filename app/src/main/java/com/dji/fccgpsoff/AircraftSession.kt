@@ -35,6 +35,7 @@ object AircraftSession {
             FlightState.reset()
             StartupProbe.resetForNewDrone()
             ParamMeta.clear()      // metadata is per-firmware; a different aircraft invalidates it
+            ParamAlias.clear()     // and so is which spelling of a name the firmware indexes
         }
     }
 }
